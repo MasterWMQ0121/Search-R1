@@ -12,7 +12,7 @@ from tqdm import tqdm
 import datasets
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 def load_corpus(corpus_path: str):
@@ -35,14 +35,18 @@ def load_docs(corpus, doc_idxs):
     results = [corpus[int(idx)] for idx in doc_idxs]
     return results
 
-def load_model(model_path: str, use_fp16: bool = False):
-    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+def load_model(model_path: str, use_fp16: bool = False, device: str = "cuda", revision: str = None):
+    if device == "cpu" and use_fp16:
+        raise ValueError("FP16 retrieval is not supported on CPU")
+    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, revision=revision)
+    model = AutoModel.from_pretrained(model_path, trust_remote_code=True, revision=revision)
     model.eval()
-    model.cuda()
+    model.to(device)
     if use_fp16: 
         model = model.half()
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, use_fast=True, trust_remote_code=True, revision=revision
+    )
     return model, tokenizer
 
 def pooling(
@@ -62,14 +66,18 @@ def pooling(
         raise NotImplementedError("Pooling method not implemented!")
 
 class Encoder:
-    def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
+    def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16,
+                 device="cuda", model_revision=None):
         self.model_name = model_name
         self.model_path = model_path
         self.pooling_method = pooling_method
         self.max_length = max_length
         self.use_fp16 = use_fp16
+        self.device = device
 
-        self.model, self.tokenizer = load_model(model_path=model_path, use_fp16=use_fp16)
+        self.model, self.tokenizer = load_model(
+            model_path=model_path, use_fp16=use_fp16, device=device, revision=model_revision
+        )
         self.model.eval()
 
     @torch.no_grad()
@@ -94,7 +102,7 @@ class Encoder:
                                 truncation=True,
                                 return_tensors="pt"
                                 )
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         if "T5" in type(self.model).__name__:
             # T5-based retrieval model
@@ -118,7 +126,8 @@ class Encoder:
         query_emb = query_emb.astype(np.float32, order="C")
         
         del inputs, output
-        torch.cuda.empty_cache()
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
         return query_emb
 
@@ -220,7 +229,9 @@ class DenseRetriever(BaseRetriever):
             model_path = config.retrieval_model_path,
             pooling_method = config.retrieval_pooling_method,
             max_length = config.retrieval_query_max_length,
-            use_fp16 = config.retrieval_use_fp16
+            use_fp16 = config.retrieval_use_fp16,
+            device = config.device,
+            model_revision = config.retrieval_model_revision,
         )
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
@@ -263,7 +274,8 @@ class DenseRetriever(BaseRetriever):
             scores.extend(batch_scores)
             
             del batch_emb, batch_scores, batch_idxs, query_batch, flat_idxs, batch_results
-            torch.cuda.empty_cache()
+            if self.config.device == "cuda":
+                torch.cuda.empty_cache()
             
         if return_score:
             return results, scores
@@ -299,7 +311,9 @@ class Config:
         retrieval_pooling_method: str = "mean",
         retrieval_query_max_length: int = 256,
         retrieval_use_fp16: bool = False,
-        retrieval_batch_size: int = 128
+        retrieval_batch_size: int = 128,
+        device: str = "cuda",
+        retrieval_model_revision: str = None,
     ):
         self.retrieval_method = retrieval_method
         self.retrieval_topk = retrieval_topk
@@ -313,6 +327,13 @@ class Config:
         self.retrieval_query_max_length = retrieval_query_max_length
         self.retrieval_use_fp16 = retrieval_use_fp16
         self.retrieval_batch_size = retrieval_batch_size
+        self.device = device
+        self.retrieval_model_revision = retrieval_model_revision
+
+        if self.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+        if self.faiss_gpu and self.device != "cuda":
+            raise ValueError("faiss_gpu requires device='cuda'")
 
 
 class QueryRequest(BaseModel):
@@ -322,6 +343,8 @@ class QueryRequest(BaseModel):
 
 
 app = FastAPI()
+config = None
+retriever = None
 
 @app.post("/retrieve")
 def retrieve_endpoint(request: QueryRequest):
@@ -334,14 +357,22 @@ def retrieve_endpoint(request: QueryRequest):
       "return_scores": true
     }
     """
-    if not request.topk:
+    if not request.queries or any(not isinstance(query, str) or not query.strip() for query in request.queries):
+        raise HTTPException(status_code=400, detail="queries must contain at least one non-empty string")
+    if request.topk is not None and request.topk <= 0:
+        raise HTTPException(status_code=400, detail="topk must be greater than zero")
+    if config is None or retriever is None:
+        raise HTTPException(status_code=503, detail="retriever is not initialized")
+    if request.topk is None:
         request.topk = config.retrieval_topk  # fallback to default
 
     # Perform batch retrieval
     results, scores = retriever.batch_search(
         query_list=request.queries,
         num=request.topk,
-        return_score=request.return_scores
+        # Always collect scores so the return type is stable. They are omitted
+        # from the response below unless the caller asks for them.
+        return_score=True
     )
     
     # Format response
@@ -366,7 +397,13 @@ if __name__ == "__main__":
     parser.add_argument("--topk", type=int, default=3, help="Number of retrieved passages for one query.")
     parser.add_argument("--retriever_name", type=str, default="e5", help="Name of the retriever model.")
     parser.add_argument("--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model.")
+    parser.add_argument("--retriever_revision", type=str, default=None,
+                        help="Optional pinned Hugging Face model revision.")
     parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for computation')
+    parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda',
+                        help='Torch device for query encoding (default: cuda).')
+    parser.add_argument('--host', type=str, default='0.0.0.0')
+    parser.add_argument('--port', type=int, default=8000)
 
     args = parser.parse_args()
     
@@ -381,12 +418,14 @@ if __name__ == "__main__":
         retrieval_model_path=args.retriever_model,
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
-        retrieval_use_fp16=True,
+        retrieval_use_fp16=(args.device == "cuda"),
         retrieval_batch_size=512,
+        device=args.device,
+        retrieval_model_revision=args.retriever_revision,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
     retriever = get_retriever(config)
     
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host=args.host, port=args.port)

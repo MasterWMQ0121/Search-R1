@@ -16,15 +16,21 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig
 
 def load_model(
         model_path: str, 
-        use_fp16: bool = False
+        use_fp16: bool = False,
+        device: str = "cuda",
+        revision: str = None,
     ):
-    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
+    if device == "cpu" and use_fp16:
+        raise ValueError("--use_fp16 is not supported with --device cpu")
+    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True, revision=revision)
+    model = AutoModel.from_pretrained(model_path, trust_remote_code=True, revision=revision)
     model.eval()
-    model.cuda()
+    model.to(device)
     if use_fp16: 
         model = model.half()
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, use_fast=True, trust_remote_code=True, revision=revision
+    )
 
     return model, tokenizer
 
@@ -72,7 +78,9 @@ class Index_Builder:
             faiss_type=None,
             embedding_path=None,
             save_embedding=False,
-            faiss_gpu=False
+            faiss_gpu=False,
+            device="cuda",
+            model_revision=None,
         ):
         
         self.retrieval_method = retrieval_method.lower()
@@ -87,8 +95,15 @@ class Index_Builder:
         self.embedding_path = embedding_path
         self.save_embedding = save_embedding
         self.faiss_gpu = faiss_gpu
+        self.device = device
+        self.model_revision = model_revision
 
-        self.gpu_num = torch.cuda.device_count()
+        if self.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
+        if self.faiss_gpu and self.device != "cuda":
+            raise ValueError("--faiss_gpu requires --device cuda")
+
+        self.gpu_num = torch.cuda.device_count() if self.device == "cuda" else 0
         # prepare save dir
         print(self.save_dir)
         if not os.path.exists(self.save_dir):
@@ -186,7 +201,7 @@ class Index_Builder:
             memmap[:] = all_embeddings
 
     def encode_all(self):
-        if self.gpu_num > 1:
+        if self.device == "cuda" and self.gpu_num > 1:
             print("Use multi gpu!")
             self.encoder = torch.nn.DataParallel(self.encoder)
             self.batch_size = self.batch_size * self.gpu_num
@@ -209,9 +224,7 @@ class Index_Builder:
                         truncation=True,
                         return_tensors='pt',
                         max_length=self.max_length,
-            ).to('cuda')
-
-            inputs = {k: v.cuda() for k, v in inputs.items()}
+            ).to(self.device)
 
             #TODO: support encoder-only T5 model
             if "T5" in type(self.encoder).__name__:
@@ -252,7 +265,9 @@ class Index_Builder:
             print("The index file already exists and will be overwritten.")
         
         self.encoder, self.tokenizer = load_model(model_path = self.model_path, 
-                                                  use_fp16 = self.use_fp16)
+                                                  use_fp16 = self.use_fp16,
+                                                  device = self.device,
+                                                  revision = self.model_revision)
         if self.embedding_path is not None:
             hidden_size = self.encoder.config.hidden_size
             corpus_size = len(self.corpus)
@@ -300,6 +315,7 @@ def main():
     # Basic parameters
     parser.add_argument('--retrieval_method', type=str)
     parser.add_argument('--model_path', type=str, default=None)
+    parser.add_argument('--model_revision', type=str, default=None)
     parser.add_argument('--corpus_path', type=str)
     parser.add_argument('--save_dir', default= 'indexes/',type=str)
 
@@ -312,6 +328,8 @@ def main():
     parser.add_argument('--embedding_path', default=None, type=str)
     parser.add_argument('--save_embedding', action='store_true', default=False)
     parser.add_argument('--faiss_gpu', default=False, action='store_true')
+    parser.add_argument('--device', choices=['cpu', 'cuda'], default='cuda',
+                        help='Torch device for dense encoding (default: cuda).')
     
     args = parser.parse_args()
 
@@ -340,7 +358,9 @@ def main():
                         faiss_type = args.faiss_type,
                         embedding_path = args.embedding_path,
                         save_embedding = args.save_embedding,
-                        faiss_gpu = args.faiss_gpu
+                        faiss_gpu = args.faiss_gpu,
+                        device = args.device,
+                        model_revision = args.model_revision,
                     )
     index_builder.build_index()
 

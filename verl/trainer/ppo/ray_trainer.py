@@ -424,6 +424,13 @@ class RayPPOTrainer(object):
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
+        max_optimizer_steps = self.config.trainer.get('max_optimizer_steps', None)
+        if max_optimizer_steps is not None:
+            if max_optimizer_steps <= 0:
+                raise ValueError('trainer.max_optimizer_steps must be greater than zero')
+            # Keep optimizer/scheduler horizons truthful even though the legacy
+            # global-step counter starts at one.
+            total_training_steps = max_optimizer_steps
 
         self.total_training_steps = total_training_steps
         print(f'Total training steps: {self.total_training_steps}')
@@ -671,6 +678,8 @@ class RayPPOTrainer(object):
 
         # we start from step 1
         self.global_steps += 1
+        optimizer_steps = 0
+        max_optimizer_steps = self.config.trainer.get('max_optimizer_steps', None)
 
         # Agent config preparation
         gen_config = GenerationConfig(
@@ -818,8 +827,10 @@ class RayPPOTrainer(object):
                             if self.config.do_search and self.config.actor_rollout_ref.actor.state_masking:
                                 batch, metrics = self._create_loss_mask(batch, metrics)
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                            optimizer_steps += 1
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
                         metrics.update(actor_output_metrics)
+                        metrics['training/optimizer_steps'] = optimizer_steps
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
@@ -842,7 +853,14 @@ class RayPPOTrainer(object):
 
                 self.global_steps += 1
 
-                if self.global_steps >= self.total_training_steps:
+                if max_optimizer_steps is not None and optimizer_steps >= max_optimizer_steps:
+                    if self.val_reward_fn is not None:
+                        val_metrics = self._validate()
+                        pprint(f'Final validation metrics: {val_metrics}')
+                        logger.log(data=val_metrics, step=self.global_steps)
+                    return
+
+                if max_optimizer_steps is None and self.global_steps >= self.total_training_steps:
 
                     # perform validation after training
                     if self.val_reward_fn is not None:

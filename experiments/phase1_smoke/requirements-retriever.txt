@@ -1,0 +1,19 @@
+# Isolated CPU preparation environment. Pins remain compatible with the repo's
+# vLLM 0.6.3 / transformers constraints; this does not replace requirements.txt.
+torch==2.4.0
+transformers==4.46.3
+datasets==3.1.0
+huggingface-hub==0.26.5
+hydra-core==1.3.2
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
+faiss-cpu==1.9.0
+fastapi==0.112.4
+uvicorn==0.30.6
+requests==2.32.3
+httpx==0.27.2
+pytest==8.3.3
+ray==2.40.0
+tensordict==0.5.0
+tqdm==4.67.1
