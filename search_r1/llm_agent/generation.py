@@ -366,9 +366,18 @@ class LLMGenerationManager:
         """
         cur_actions, contents = self.postprocess_predictions(predictions)
         next_obs, dones, valid_action, is_search = [], [], [], []
+
+        # Empty search tags are syntactically recognizable but are not valid
+        # environment actions. Keep them on the normal invalid-action path and
+        # never send blank queries to the retriever.
+        for i, (action, content) in enumerate(zip(cur_actions, contents)):
+            if action == 'search':
+                contents[i] = content.strip()
+                if not contents[i]:
+                    cur_actions[i] = None
         
         search_queries = [content for action, content in zip(cur_actions, contents) if action == 'search']
-        if do_search:
+        if do_search and search_queries:
             search_results = self.batch_search(search_queries)
             assert len(search_results) == sum([1 for action in cur_actions if action == 'search'])
         else:
@@ -435,7 +444,7 @@ If I want to give the final answer, I should put the answer between <answer> and
             
         return actions, contents
 
-    def batch_search(self, queries: List[str] = None) -> str:
+    def batch_search(self, queries: List[str] = None) -> List[str]:
         """
         Batchified search for queries.
         Args:
@@ -443,19 +452,51 @@ If I want to give the final answer, I should put the answer between <answer> and
         Returns:
             search results which is concatenated into a string
         """
-        results = self._batch_search(queries)['result']
+        queries = [query.strip() for query in (queries or [])]
+        if not queries:
+            return []
+        if any(not query for query in queries):
+            raise ValueError("Retriever queries must be non-empty strings")
+
+        response_payload = self._batch_search(queries)
+        results = response_payload['result']
         
         return [self._passages2string(result) for result in results]
 
     def _batch_search(self, queries):
-        
+        queries = [query.strip() for query in (queries or [])]
+        if not queries:
+            return {'result': []}
+        if any(not query for query in queries):
+            raise ValueError("Retriever queries must be non-empty strings")
+
         payload = {
             "queries": queries,
             "topk": self.config.topk,
             "return_scores": True
         }
-        
-        return requests.post(self.config.search_url, json=payload).json()
+
+        response = requests.post(self.config.search_url, json=payload)
+        response_body = response.text[:500]
+        context = (
+            f"status={response.status_code}, queries={queries!r}, "
+            f"response_body={response_body!r}"
+        )
+
+        if not 200 <= response.status_code < 300:
+            raise RuntimeError(f"Retriever request failed: {context}")
+
+        try:
+            response_payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Retriever returned invalid JSON: {context}") from exc
+
+        if not isinstance(response_payload, dict) or 'result' not in response_payload:
+            raise RuntimeError(f"Retriever response is missing 'result': {context}")
+        if not isinstance(response_payload['result'], list):
+            raise RuntimeError(f"Retriever response 'result' must be a list: {context}")
+
+        return response_payload
 
     def _passages2string(self, retrieval_result):
         format_reference = ''
