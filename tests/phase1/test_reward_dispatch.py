@@ -1,11 +1,26 @@
+import subprocess
+import sys
+
 import pytest
 
-from verl.trainer.main_ppo import _select_rm_score_fn
 from verl.utils.reward_score import qa_em
+from verl.utils.reward_score.dispatch import _select_rm_score_fn
 
 
 PROMPT_EXAMPLE = "For example, <answer> Beijing </answer>. Question: capital of France?"
 GROUND_TRUTH = {"target": ["Paris"]}
+
+
+def test_reward_dispatch_import_has_no_training_dependencies():
+    code = """
+import sys
+from verl.utils.reward_score.dispatch import _select_rm_score_fn
+forbidden = ('ray', 'codetiming', 'vllm', 'torch')
+loaded = [name for name in sys.modules if name.split('.')[0] in forbidden or name.startswith('verl.trainer')]
+if loaded:
+    raise SystemExit(f'unexpected heavyweight imports: {loaded}')
+"""
+    subprocess.run([sys.executable, "-c", code], check=True, capture_output=True, text=True)
 
 
 def test_phase1_data_source_dispatches_to_qa_exact_match():
