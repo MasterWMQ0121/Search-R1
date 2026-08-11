@@ -53,9 +53,21 @@ def test_phase1_prompt_requires_tagged_answer_after_information():
 
     assert "If the retrieved evidence contains the answer" in prompt
     assert "your NEXT assistant response MUST consist of exactly two tagged blocks and nothing else" in normalized
-    assert "<think>The retrieved evidence says the clear daytime sky is blue.</think>" in prompt
-    assert "<answer>blue</answer>" in prompt
+    assert "<think>The retrieved fixture contains explicit accepted answer evidence.</think>" in prompt
+    assert "<answer>ANSWER_TEXT</answer>" in prompt
     assert "Once an information block appears, follow AFTER RECEIVING INFORMATION instead" in normalized
+
+
+def test_phase1_fixture_answer_prefix_is_a_terminal_signal():
+    prompt = make_prompt(QUESTION)
+    normalized = " ".join(prompt.split())
+
+    assert 'literal text "Accepted answer evidence:"' in prompt
+    assert "You MUST NOT search again" in prompt
+    assert "Copy the answer text immediately following that prefix" in prompt
+    assert "retrieval is sufficient regardless of whether you think more information would be useful" in normalized
+    assert "Replace ANSWER_TEXT with the copied evidence and stop immediately after </answer>" in normalized
+    assert "only to this deliberately answer-leaky Phase-1 fixture" in prompt
 
 
 def test_phase1_prompt_forbids_plain_prose_answers():
