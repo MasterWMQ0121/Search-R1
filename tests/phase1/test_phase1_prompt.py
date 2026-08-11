@@ -29,7 +29,7 @@ def test_phase1_prompt_forbids_answer_before_information():
 
     assert "Do not answer the question" in prompt
     assert "do not produce any final-answer action before receiving an <information>...</information> block" in normalized
-    assert "must search and must not answer" in prompt
+    assert "so search and do not answer" in prompt
 
 
 def test_phase1_prompt_contains_search_r1_protocol_tags_and_reward_example():
@@ -45,6 +45,25 @@ def test_phase1_prompt_contains_search_r1_protocol_tags_and_reward_example():
 
     # QA EM expects the prompt's single format example plus the generated answer.
     assert len(re.findall(r"<answer>.*?</answer>", prompt, re.DOTALL)) == 1
+
+
+def test_phase1_prompt_requires_tagged_answer_after_information():
+    prompt = make_prompt(QUESTION)
+    normalized = " ".join(prompt.split())
+
+    assert "If the retrieved evidence contains the answer" in prompt
+    assert "your NEXT assistant response MUST consist of exactly two tagged blocks and nothing else" in normalized
+    assert "<think>The retrieved evidence says the clear daytime sky is blue.</think>" in prompt
+    assert "<answer>blue</answer>" in prompt
+    assert "Once an information block appears, follow AFTER RECEIVING INFORMATION instead" in normalized
+
+
+def test_phase1_prompt_forbids_plain_prose_answers():
+    prompt = make_prompt(QUESTION)
+
+    assert '"the answer is ..."' in prompt
+    assert '"to answer: ..."' in prompt
+    assert "any other text outside protocol tags" in prompt
 
 
 def test_phase1_prompt_is_explicitly_not_model_quality_evidence():

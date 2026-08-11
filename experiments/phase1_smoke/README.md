@@ -96,11 +96,14 @@ remain deliberately unexecuted in this phase.
 
 The Phase-1 data prompt is deliberately stronger than the production Search-R1
 prompt: it supplies the exact mandatory first-turn `<think>` then non-empty
-`<search>` shape and forbids `<answer>` before `<information>`. This gate is only
-evidence that the real action/retrieval/observation plumbing runs; it is not a
-model-quality result. The 128-token response cap gives the small instruct model
-modest room to follow the tagged format while keeping the two-turn worst case at
-`384 + 2*128 + 2*192 = 1,024`, below the 1,152-token rolling ceiling.
+`<search>` shape, forbids final answers before `<information>`, and requires an
+exact `<think>` then `<answer>` response when retrieved evidence contains the
+answer. Plain-prose forms such as “the answer is” and “to answer:” are explicitly
+invalid. This gate is only evidence that the real action/retrieval/observation
+plumbing runs; it is not a model-quality result. The 128-token response cap gives
+the small instruct model modest room to follow the tagged format while keeping
+the two-turn worst case at `384 + 2*128 + 2*192 = 1,024`, below the 1,152-token
+rolling ceiling.
 
 See [the detailed implementation note](../../docs/phase1_small_scale.md) for
 the contract tests and compatibility changes.
