@@ -82,7 +82,7 @@ bash experiments/phase1_smoke/run.sh
 The script is configured for `Qwen/Qwen2.5-0.5B-Instruct`, one GPU, GRPO,
 four trajectories per each of two base questions (8 trajectories), mini-batch
 8, micro-batch 1, exactly 8 actor optimizer updates, two search turns, top-k 2,
-96 response tokens, 192 observation tokens, 384 initial prompt tokens, and a
+128 response tokens, 192 observation tokens, 384 initial prompt tokens, and a
 1,152-token rolling prompt ceiling. Tensor parallelism is 1, rollout memory
 utilization is 0.4, dtype is BF16, gradient checkpointing is enabled, reference
 parameters are offloaded, and actor parameters/gradients/optimizer state are
@@ -93,6 +93,14 @@ compatible drivers, Python 3.9, PyTorch 2.4.0, vLLM 0.6.3, the repository
 installed editable, FlashAttention 2, and a live retriever from
 `launch_retriever.sh`. GPU dependency installation and the training command
 remain deliberately unexecuted in this phase.
+
+The Phase-1 data prompt is deliberately stronger than the production Search-R1
+prompt: it supplies the exact mandatory first-turn `<think>` then non-empty
+`<search>` shape and forbids `<answer>` before `<information>`. This gate is only
+evidence that the real action/retrieval/observation plumbing runs; it is not a
+model-quality result. The 128-token response cap gives the small instruct model
+modest room to follow the tagged format while keeping the two-turn worst case at
+`384 + 2*128 + 2*192 = 1,024`, below the 1,152-token rolling ceiling.
 
 See [the detailed implementation note](../../docs/phase1_small_scale.md) for
 the contract tests and compatibility changes.

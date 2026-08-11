@@ -76,13 +76,27 @@ def normalize_question(question: str) -> str:
 
 def make_prompt(question: str) -> str:
     return (
-        "Answer the given question. You must conduct reasoning inside <think> and </think> "
-        "first every time you get new information. After reasoning, call the search engine "
-        "with <search> query </search>; it returns passages between <information> and "
-        "</information>. For this Phase-1 smoke run, make at least one search call. When no "
-        "further external knowledge is needed, provide only the final answer inside <answer> "
-        "and </answer>. For example, <answer> Beijing </answer>. "
+        "PHASE-1 SEARCH-R1 PROTOCOL SMOKE TEST. This deliberately strict instruction validates "
+        "plumbing, not model quality. Follow the tagged protocol exactly; do not write plain "
+        "prose outside the tags.\n\n"
+        "MANDATORY FIRST RESPONSE:\n"
+        "Your FIRST assistant response must contain a brief reason inside <think>...</think>, "
+        "then end in exactly one non-empty <search>...</search>. The search text must contain "
+        "at least one non-whitespace character. Stop immediately after </search>. Do not answer "
+        "the question and do not produce any final-answer action before receiving an "
+        "<information>...</information> block, even if you already know the answer.\n\n"
+        "Use this exact first-response shape:\n"
+        "<think>I need to retrieve evidence before answering.</think>\n"
+        f"<search>{question}</search>\n\n"
+        "AFTER RECEIVING <information>...</information>:\n"
+        "Every time new information arrives, reason inside <think>...</think> before the next "
+        "action. Then either end with one non-empty <search>...</search> to search again, or end "
+        "with the final short answer using the exact final-answer format shown next. "
+        "Format-only example "
+        "for an unrelated question: <answer> Beijing </answer>.\n\n"
         f"Question: {question}\n"
+        "Remember: the next assistant response is the FIRST response, so it must search and must "
+        "not answer."
     )
 
 
