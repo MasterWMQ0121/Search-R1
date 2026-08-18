@@ -1,5 +1,7 @@
 import ast
+import gc
 from pathlib import Path
+import weakref
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -100,11 +102,19 @@ class _FakeHandle:
     def __init__(self, flat_param, native_offload=False):
         self.flat_param = flat_param
         self._offload_params = native_offload
+        self._use_orig_params = False
+        self.uses_sharded_strategy = False
         self.moves = []
+        self.view_refreshes = []
 
     def flat_param_to(self, device, non_blocking=False):
         self.moves.append((str(device), non_blocking))
         self.flat_param.data = self.flat_param.to(device, non_blocking=non_blocking)
+
+    def _use_unsharded_views(self, as_params):
+        self.view_refreshes.append(as_params)
+        for param_name, param_module, _ in self.flat_param._param_infos:
+            setattr(param_module, param_name, self.flat_param.data)
 
 
 class _FakeFSDP:
@@ -150,11 +160,13 @@ def _fake_lazy_init(model, root_model):
 
 def test_fsdp_model_offload_moves_handle_owned_flat_parameter_storage():
     fake_torch = _FakeTorch()
-    offload_model, load_model = _load_fsdp_utils_functions(
+    refresh_views, offload_model, load_model = _load_fsdp_utils_functions(
+        "_refresh_fsdp_unflattened_views",
         "offload_fsdp_model_to_cpu",
         "load_fsdp_model_to_gpu",
         globals_dict={"torch": fake_torch, "FSDP": _FakeFSDP, "_lazy_init": _fake_lazy_init},
     )
+    del refresh_views
 
     flat_param = _FakeFlatParameter(_FakeDevice("cuda", 0))
     handle = _FakeHandle(flat_param)
@@ -167,6 +179,9 @@ def test_fsdp_model_offload_moves_handle_owned_flat_parameter_storage():
     assert str(flat_param.data.device) == "cpu"
     assert str(flat_param._local_shard.device) == "cpu"
     assert flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
+    assert handle.view_refreshes == [False]
+    assert str(flat_param._unflattened_module.weight.device) == "cpu"
+    assert flat_param._unflattened_module.weight.data_ptr() == flat_param.data.data_ptr()
 
     load_model(model, device_id=0)
 
@@ -175,32 +190,61 @@ def test_fsdp_model_offload_moves_handle_owned_flat_parameter_storage():
     assert str(flat_param.data.device) == "cuda:0"
     assert str(flat_param._local_shard.device) == "cuda:0"
     assert flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
+    assert handle.view_refreshes == [False, False]
+    assert str(flat_param._unflattened_module.weight.device) == "cuda:0"
+    assert flat_param._unflattened_module.weight.data_ptr() == flat_param.data.data_ptr()
     assert fake_torch.cuda.empty_cache_calls == 1
 
 
 def test_fsdp_model_offload_does_not_override_native_cpu_offload_handles():
     fake_torch = _FakeTorch()
-    (offload_model,) = _load_fsdp_utils_functions(
+    refresh_views, offload_model = _load_fsdp_utils_functions(
+        "_refresh_fsdp_unflattened_views",
         "offload_fsdp_model_to_cpu",
         globals_dict={"torch": fake_torch, "FSDP": _FakeFSDP, "_lazy_init": _fake_lazy_init},
     )
+    del refresh_views
     handle = _FakeHandle(_FakeFlatParameter(_FakeDevice("cpu")), native_offload=True)
 
     offload_model(_FakeFSDP([handle]))
 
     assert handle.moves == []
+    assert handle.view_refreshes == []
+
+
+def test_view_refresh_is_limited_to_no_shard_without_original_parameters():
+    fake_torch = _FakeTorch()
+    (refresh_views,) = _load_fsdp_utils_functions(
+        "_refresh_fsdp_unflattened_views",
+        globals_dict={"torch": fake_torch},
+    )
+    handle = _FakeHandle(_FakeFlatParameter(_FakeDevice("cpu")))
+
+    handle._use_orig_params = True
+    refresh_views(handle)
+    assert handle.view_refreshes == []
+
+    handle._use_orig_params = False
+    handle.uses_sharded_strategy = True
+    refresh_views(handle)
+    assert handle.view_refreshes == []
+
+    handle.uses_sharded_strategy = False
+    refresh_views(handle)
+    assert handle.view_refreshes == [False]
 
 
 def test_fsdp_storage_summary_reports_canonical_and_unflattened_view_devices():
     fake_torch = _FakeTorch()
-    offload_model, storage_nbytes, get_summary, format_summary = _load_fsdp_utils_functions(
+    refresh_views, offload_model, storage_nbytes, get_summary, format_summary = _load_fsdp_utils_functions(
+        "_refresh_fsdp_unflattened_views",
         "offload_fsdp_model_to_cpu",
         "_tensor_storage_nbytes",
         "get_fsdp_model_device_summary",
         "format_fsdp_model_device_summary",
         globals_dict={"torch": fake_torch, "FSDP": _FakeFSDP, "_lazy_init": _fake_lazy_init},
     )
-    del storage_nbytes
+    del refresh_views, storage_nbytes
     model = _FakeFSDP([_FakeHandle(_FakeFlatParameter(_FakeDevice("cuda", 0)))])
 
     offload_model(model)
@@ -210,10 +254,99 @@ def test_fsdp_storage_summary_reports_canonical_and_unflattened_view_devices():
     assert summary["parameter_data"]["cpu"]["bytes"] == 4096
     assert summary["flat_param_data"]["cpu"]["bytes"] == 4096
     assert summary["flat_param_local_shard"]["cpu"]["bytes"] == 4096
-    assert summary["unflattened_param_view"]["cuda:0"]["bytes"] == 4096
+    assert summary["unflattened_param_view"]["cpu"]["bytes"] == 4096
     assert "parameter_data[cpu=" in formatted
     assert "flat_param_local_shard[cpu=" in formatted
-    assert "unflattened_param_view[cuda:0=" in formatted
+    assert "unflattened_param_view[cpu=" in formatted
+
+
+def test_no_shard_storage_rebinding_refreshes_real_cpu_tensor_views_symmetrically():
+    import torch
+    from torch.distributed.fsdp._flat_param import FlatParamHandle, HandleShardingStrategy
+
+    class _FakeProcessGroup:
+        @staticmethod
+        def rank():
+            return 0
+
+        @staticmethod
+        def size():
+            return 1
+
+    module = torch.nn.Linear(4, 3, bias=True)
+    handle = FlatParamHandle(
+        list(module.parameters()),
+        module,
+        torch.device("cpu"),
+        HandleShardingStrategy.NO_SHARD,
+        False,
+        None,
+        None,
+        False,
+        _FakeProcessGroup(),
+        False,
+    )
+    handle.shard()
+    handle.flat_param._local_shard = handle.flat_param.data
+    model = _FakeFSDP([handle])
+
+    events = []
+    original_refresh = handle._use_unsharded_views
+
+    def tracked_refresh(as_params):
+        events.append(("refresh", as_params))
+        original_refresh(as_params)
+
+    def tracked_move(device, non_blocking=False):
+        events.append(("move", str(device), non_blocking))
+        # Keep this regression CPU-only while still forcing a new storage,
+        # which is the part of device movement relevant to view rebinding.
+        handle.flat_param.data = handle.flat_param.detach().clone()
+
+    handle._use_unsharded_views = tracked_refresh
+    handle.flat_param_to = tracked_move
+
+    refresh_views, offload_model, load_model = _load_fsdp_utils_functions(
+        "_refresh_fsdp_unflattened_views",
+        "offload_fsdp_model_to_cpu",
+        "load_fsdp_model_to_gpu",
+        globals_dict={"torch": torch, "FSDP": _FakeFSDP, "_lazy_init": _fake_lazy_init},
+    )
+    del refresh_views
+
+    assert isinstance(module.weight, torch.Tensor)
+    assert not isinstance(module.weight, torch.nn.Parameter)
+    assert torch._C._is_alias_of(module.weight, handle.flat_param)
+
+    initial_view_ref = weakref.ref(module.weight)
+    initial_storage = module.weight.untyped_storage()._cdata
+
+    offload_model(model)
+    gc.collect()
+
+    offloaded_storage = module.weight.untyped_storage()._cdata
+    assert initial_view_ref() is None
+    assert offloaded_storage != initial_storage
+    assert torch._C._is_alias_of(module.weight, handle.flat_param)
+    assert torch._C._is_alias_of(module.weight, handle.flat_param._local_shard)
+    assert not isinstance(module.weight, torch.nn.Parameter)
+
+    offloaded_view_ref = weakref.ref(module.weight)
+    load_model(model, device_id=0)
+    gc.collect()
+
+    loaded_storage = module.weight.untyped_storage()._cdata
+    assert offloaded_view_ref() is None
+    assert loaded_storage != offloaded_storage
+    assert torch._C._is_alias_of(module.weight, handle.flat_param)
+    assert torch._C._is_alias_of(module.weight, handle.flat_param._local_shard)
+    assert not isinstance(module.weight, torch.nn.Parameter)
+    assert events == [
+        ("move", "cpu", True),
+        ("refresh", False),
+        ("move", "cuda:0", True),
+        ("refresh", False),
+    ]
 
 
 def test_existing_param_and_grad_entrypoints_delegate_to_fsdp_handle_helpers():
@@ -228,6 +361,35 @@ def test_existing_param_and_grad_entrypoints_delegate_to_fsdp_handle_helpers():
 
     assert "offload_fsdp_model_to_cpu" in calls_by_function["offload_fsdp_param_and_grad"]
     assert "load_fsdp_model_to_gpu" in calls_by_function["load_fsdp_param_and_grad"]
+    assert "_refresh_fsdp_unflattened_views" in calls_by_function["offload_fsdp_model_to_cpu"]
+    assert "_refresh_fsdp_unflattened_views" in calls_by_function["load_fsdp_model_to_gpu"]
+
+
+def test_actor_and_reference_lifecycles_use_symmetric_param_transfer_entrypoints():
+    tree = ast.parse(WORKER_SOURCE)
+    worker_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ActorRolloutRefWorker"
+    )
+    methods = {
+        node.name: node
+        for node in worker_class.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"init_model", "update_actor", "generate_sequences", "compute_ref_log_prob", "save_checkpoint"}
+    }
+
+    def called_names(method_name):
+        return {
+            call.func.id
+            for call in ast.walk(methods[method_name])
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+        }
+
+    assert "offload_fsdp_param_and_grad" in called_names("init_model")
+    for method_name in ("update_actor", "generate_sequences", "compute_ref_log_prob", "save_checkpoint"):
+        assert "load_fsdp_param_and_grad" in called_names(method_name)
+        assert "offload_fsdp_param_and_grad" in called_names(method_name)
 
 
 def test_actor_params_are_offloaded_before_rollout_build():

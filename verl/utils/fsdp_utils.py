@@ -123,6 +123,25 @@ def load_fsdp_grad(module, device_id, empty_cache=True):
         torch.cuda.empty_cache()
 
 
+def _refresh_fsdp_unflattened_views(handle):
+    """Refresh NO_SHARD module Tensor views after flat-storage rebinding.
+
+    PyTorch 2.4's ``FlatParamHandle.flat_param_to()`` refreshes original
+    parameter views only when ``use_orig_params=True``. With
+    ``use_orig_params=False``, FSDP instead exposes unregistered Tensor views
+    during computation. For NO_SHARD, the flat parameter is unsharded even at
+    rest, so reuse FSDP's own unflattening path with ``as_params=False`` to
+    preserve those semantics while pointing the views at the new storage.
+
+    Sharded strategies retain their existing behavior: their idle-time module
+    view invariants differ, and this manual offload path has only been
+    validated for NO_SHARD.
+    """
+    if handle._use_orig_params or handle.uses_sharded_strategy:
+        return
+    handle._use_unsharded_views(as_params=False)
+
+
 @torch.no_grad()
 def offload_fsdp_model_to_cpu(model: FSDP, empty_cache=True):
     """Move FSDP1's canonical flat-parameter shards to CPU.
@@ -149,6 +168,7 @@ def offload_fsdp_model_to_cpu(model: FSDP, empty_cache=True):
         handle.flat_param_to(torch.device("cpu"), non_blocking=True)
         # Keep FSDP's canonical local-shard alias on the moved storage.
         flat_param._local_shard = flat_param.data
+        _refresh_fsdp_unflattened_views(handle)
 
     if empty_cache:
         torch.cuda.empty_cache()
@@ -169,6 +189,7 @@ def load_fsdp_model_to_gpu(model: FSDP, device_id):
         flat_param = handle.flat_param
         handle.flat_param_to(device, non_blocking=True)
         flat_param._local_shard = flat_param.data
+        _refresh_fsdp_unflattened_views(handle)
 
 
 def offload_fsdp_param_and_grad(module, offload_grad=False):
