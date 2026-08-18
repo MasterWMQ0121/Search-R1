@@ -157,6 +157,60 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
+def compute_grpo_group_metrics(token_level_scores: torch.Tensor,
+                               advantages: torch.Tensor,
+                               eos_mask: torch.Tensor,
+                               index):
+    """Summarize within-UID outcome variation without changing GRPO math."""
+    scores = (token_level_scores * (token_level_scores != 0)).sum(dim=-1)
+    id2score = defaultdict(list)
+
+    with torch.no_grad():
+        for sample_index, score in zip(index, scores):
+            id2score[sample_index].append(score)
+
+        group_stds = []
+        for group_scores in id2score.values():
+            if len(group_scores) == 1:
+                group_stds.append(torch.zeros_like(group_scores[0]))
+            else:
+                # Match compute_grpo_outcome_advantage's default (sample) std.
+                group_stds.append(torch.std(torch.stack(group_scores)))
+
+        if group_stds:
+            stacked_stds = torch.stack(group_stds)
+            varying_groups = (stacked_stds > 0).sum()
+            group_count = len(group_stds)
+            std_mean = stacked_stds.mean().item()
+            std_min = stacked_stds.min().item()
+            std_max = stacked_stds.max().item()
+            variance_fraction = varying_groups.item() / group_count
+        else:
+            group_count = 0
+            varying_groups = torch.tensor(0)
+            std_mean = 0.0
+            std_min = 0.0
+            std_max = 0.0
+            variance_fraction = 0.0
+
+        response_mask = eos_mask.bool()
+        sequence_has_nonzero_advantage = ((advantages != 0) & response_mask).any(dim=-1)
+        nonzero_advantage_fraction = (
+            sequence_has_nonzero_advantage.float().mean().item()
+            if sequence_has_nonzero_advantage.numel() > 0 else 0.0
+        )
+
+    return {
+        'grpo/group_count': group_count,
+        'grpo/groups_with_reward_variance': varying_groups.item(),
+        'grpo/group_reward_variance_fraction': variance_fraction,
+        'grpo/group_reward_std_mean': std_mean,
+        'grpo/reward_std_min': std_min,
+        'grpo/reward_std_max': std_max,
+        'grpo/nonzero_advantage_fraction': nonzero_advantage_fraction,
+    }
+
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio

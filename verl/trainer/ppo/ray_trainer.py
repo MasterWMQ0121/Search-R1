@@ -154,6 +154,16 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     return data
 
 
+def _build_search_prompt_uids(data_sources, prompt_indexes):
+    """Keep prompt groups distinct when per-source dataset indexes overlap."""
+    if len(data_sources) != len(prompt_indexes):
+        raise ValueError('data source and prompt index lengths must match')
+    return np.array([
+        f'{data_source}:{prompt_index}'
+        for data_source, prompt_index in zip(data_sources, prompt_indexes)
+    ], dtype=object)
+
+
 def reduce_metrics(metrics: dict):
     for key, val in metrics.items():
         metrics[key] = np.mean(val)
@@ -751,7 +761,10 @@ class RayPPOTrainer(object):
 
                         # batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                         #                                         dtype=object)
-                        batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()
+                        batch.non_tensor_batch['uid'] = _build_search_prompt_uids(
+                            batch.non_tensor_batch['data_source'],
+                            batch.non_tensor_batch['index'],
+                        )
                                             
                         # repeat to align with repeated responses in rollout
                         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -847,6 +860,15 @@ class RayPPOTrainer(object):
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                if self.config.algorithm.adv_estimator == 'grpo':
+                    response_length = batch.batch['responses'].shape[-1]
+                    response_mask = batch.batch['attention_mask'][:, -response_length:]
+                    metrics.update(core_algos.compute_grpo_group_metrics(
+                        token_level_scores=batch.batch['token_level_scores'],
+                        advantages=batch.batch['advantages'],
+                        eos_mask=response_mask,
+                        index=batch.non_tensor_batch['uid'],
+                    ))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend

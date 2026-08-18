@@ -85,7 +85,7 @@ def test_phase2_one_update_grpo_group_and_optimizer_step_are_consistent():
     assert mini_batch_size == effective_trajectories == 2
     assert mini_batch_size % micro_batch_size == 0
     assert 'batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n_agent' in TRAINER_SOURCE
-    assert "batch.non_tensor_batch['uid'] = batch.non_tensor_batch['index'].copy()" in TRAINER_SOURCE
+    assert "batch.non_tensor_batch['uid'] = _build_search_prompt_uids(" in TRAINER_SOURCE
     assert "dataloader = batch.split(self.config.ppo_mini_batch_size)" in ACTOR_SOURCE
     assert "grad_norm = self._optimizer_step()" in ACTOR_SOURCE
 
