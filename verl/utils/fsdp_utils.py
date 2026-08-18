@@ -24,6 +24,8 @@ from transformers.trainer_pt_utils import get_module_class_from_name
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp._runtime_utils import _lazy_init
 
 
 def init_fn(x: torch.nn.Module):
@@ -105,38 +107,140 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False):
     return auto_wrap_policy
 
 
-def offload_fsdp_grad(module):
+def offload_fsdp_grad(module, empty_cache=True):
     for _, param in module.named_parameters():
         if param.grad is not None:
             param.grad = param.grad.to("cpu", non_blocking=True)
-    torch.cuda.empty_cache()
+    if empty_cache:
+        torch.cuda.empty_cache()
 
 
-def load_fsdp_grad(module, device_id):
+def load_fsdp_grad(module, device_id, empty_cache=True):
     for _, param in module.named_parameters():
         if param.grad is not None:
             param.grad = param.grad.to(device_id, non_blocking=True)
-    torch.cuda.empty_cache()
+    if empty_cache:
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def offload_fsdp_model_to_cpu(model: FSDP, empty_cache=True):
+    """Move FSDP1's canonical flat-parameter shards to CPU.
+
+    FSDP owns parameter storage through ``FlatParamHandle``. Moving tensors
+    returned by ``named_parameters()`` does not reliably update all of the
+    handle's aliases, especially before FSDP lazy initialization. PyTorch 2.4
+    exposes the handle operations used here; this is the FSDP1 portion of the
+    equivalent helper in current veRL.
+    """
+    assert isinstance(model, FSDP)
+    _lazy_init(model, model)
+    assert model._is_root, "Only support root FSDP model offloading to CPU"
+
+    for handle in model._all_handles:
+        if handle._offload_params:
+            # Native FSDP CPU offload already owns this handle's placement.
+            continue
+
+        flat_param = handle.flat_param
+        assert flat_param.data.data_ptr() == flat_param._local_shard.data_ptr()
+        assert flat_param.data.size() == flat_param._local_shard.size()
+
+        handle.flat_param_to(torch.device("cpu"), non_blocking=True)
+        # Keep FSDP's canonical local-shard alias on the moved storage.
+        flat_param._local_shard = flat_param.data
+
+    if empty_cache:
+        torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def load_fsdp_model_to_gpu(model: FSDP, device_id):
+    """Move FSDP1's canonical flat-parameter shards to a CUDA device."""
+    assert isinstance(model, FSDP)
+    _lazy_init(model, model)
+    assert model._is_root, "Only support root FSDP model loading to GPU"
+
+    device = torch.device("cuda", device_id) if isinstance(device_id, int) else torch.device(device_id)
+    for handle in model._all_handles:
+        if handle._offload_params:
+            continue
+
+        flat_param = handle.flat_param
+        handle.flat_param_to(device, non_blocking=True)
+        flat_param._local_shard = flat_param.data
 
 
 def offload_fsdp_param_and_grad(module, offload_grad=False):
-    for _, param in module.named_parameters():
-        if hasattr(param, "_local_shard"):
-            param._local_shard = param._local_shard.to("cpu", non_blocking=True)
-        param.data = param.data.to('cpu', non_blocking=True)
-        if offload_grad and param.grad is not None:
-            param.grad = param.grad.to("cpu", non_blocking=True)
+    offload_fsdp_model_to_cpu(module, empty_cache=False)
+    if offload_grad:
+        offload_fsdp_grad(module, empty_cache=False)
     torch.cuda.empty_cache()
 
 
 def load_fsdp_param_and_grad(module, device_id, load_grad=False):
-    for _, param in module.named_parameters():
-        if hasattr(param, "_local_shard"):
-            param._local_shard = param._local_shard.to(device_id, non_blocking=True)
-        param.data = param.data.to(device_id, non_blocking=True)
-        if load_grad and param.grad is not None:
-            param.grad = param.grad.to(device_id, non_blocking=True)
+    load_fsdp_model_to_gpu(module, device_id=device_id)
+    if load_grad:
+        load_fsdp_grad(module, device_id=device_id, empty_cache=False)
     torch.cuda.empty_cache()
+
+
+def _tensor_storage_nbytes(tensor):
+    try:
+        return tensor.untyped_storage().nbytes()
+    except (AttributeError, RuntimeError):
+        return tensor.numel() * tensor.element_size()
+
+
+def get_fsdp_model_device_summary(module):
+    """Return tensor-storage totals by FSDP alias and device for diagnostics."""
+    summary = {}
+
+    def record(category, tensor):
+        if tensor is None or not hasattr(tensor, "device"):
+            return
+        device = str(tensor.device)
+        entry = summary.setdefault(category, {}).setdefault(device, {"bytes": 0, "tensors": 0})
+        entry["bytes"] += _tensor_storage_nbytes(tensor)
+        entry["tensors"] += 1
+
+    for _, param in module.named_parameters():
+        record("parameter_data", param.data)
+        record("parameter_grad", param.grad)
+    for _, buffer in module.named_buffers():
+        record("buffer", buffer)
+
+    handle_tensor_attrs = (
+        ("flat_param_data", "data"),
+        ("flat_param_local_shard", "_local_shard"),
+        ("flat_param_mp_shard", "_mp_shard"),
+        ("flat_param_full", "_full_param_padded"),
+        ("flat_param_full_precision", "_full_prec_full_param_padded"),
+        ("flat_param_saved_grad", "_saved_grad_shard"),
+        ("flat_param_cpu_grad", "_cpu_grad"),
+    )
+    for handle in getattr(module, "_all_handles", ()):
+        flat_param = handle.flat_param
+        for category, attribute in handle_tensor_attrs:
+            record(category, getattr(flat_param, attribute, None))
+
+    return summary
+
+
+def format_fsdp_model_device_summary(module):
+    summary = get_fsdp_model_device_summary(module)
+    if not summary:
+        return "no tensor storage found"
+
+    categories = []
+    for category in sorted(summary):
+        devices = []
+        for device in sorted(summary[category]):
+            entry = summary[category][device]
+            gib = entry["bytes"] / 1024**3
+            devices.append(f"{device}={gib:.3f} GiB/{entry['tensors']} tensors")
+        categories.append(f"{category}[{', '.join(devices)}]")
+    return "; ".join(categories)
 
 
 def offload_fsdp_optimizer(optimizer):

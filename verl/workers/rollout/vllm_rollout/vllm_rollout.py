@@ -33,6 +33,7 @@ from tensordict import TensorDict
 from torch import nn
 
 from verl import DataProto
+from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
 from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
@@ -88,6 +89,7 @@ class vLLMRollout(BaseRollout):
 
         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
             "model context length should be greater than total sequence length"
+        log_gpu_memory_usage('Before vLLM LLM construction', logger=None)
         self.inference_engine = LLM(actor_module,
                                     tokenizer=tokenizer,
                                     model_hf_config=model_hf_config,
@@ -98,9 +100,13 @@ class vLLMRollout(BaseRollout):
                                     skip_tokenizer_init=False,
                                     max_model_len=config.prompt_length + config.response_length,
                                     load_format=config.load_format)
+        log_gpu_memory_usage('After vLLM LLM construction before weight offload', logger=None)
 
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.offload_model_weights()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage('After vLLM model weight offload', logger=None)
 
         kwargs = dict(
             n=1,

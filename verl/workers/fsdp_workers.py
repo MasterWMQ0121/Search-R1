@@ -30,9 +30,9 @@ from verl.single_controller.base.decorator import register, Dispatch
 from verl.utils import hf_tokenizer
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.fs import copy_local_path_from_hdfs
-from verl.utils.fsdp_utils import get_fsdp_wrap_policy, offload_fsdp_grad, init_fn, get_init_weight_context_manager
+from verl.utils.fsdp_utils import get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager
 from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, \
-    load_fsdp_param_and_grad
+    load_fsdp_param_and_grad, format_fsdp_model_device_summary
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.flops_counter import FlopsCounter
@@ -317,6 +317,10 @@ class ActorRolloutRefWorker(Worker):
                 # vLLM rollout engine. On a single GPU, FSDP falls back to
                 # NO_SHARD, so keeping the actor resident while vLLM creates
                 # its inference copy can exhaust GPU memory.
+                log_gpu_memory_usage(
+                    'Before offload actor params during init',
+                    logger=None,
+                )
                 offload_fsdp_param_and_grad(
                     module=self.actor_module_fsdp,
                     offload_grad=self._is_offload_grad,
@@ -325,8 +329,13 @@ class ActorRolloutRefWorker(Worker):
                 torch.cuda.empty_cache()
                 log_gpu_memory_usage(
                     'After offload actor params during init',
-                    logger=logger,
+                    logger=None,
                 )
+                if self.rank == 0:
+                    print(
+                        'Actor FSDP storage after init offload: '
+                        f'{format_fsdp_model_device_summary(self.actor_module_fsdp)}'
+                    )
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
@@ -340,6 +349,11 @@ class ActorRolloutRefWorker(Worker):
                                               actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
+            if self._is_actor and self.rank == 0:
+                print(
+                    'Actor FSDP storage immediately before rollout build: '
+                    f'{format_fsdp_model_device_summary(self.actor_module_fsdp)}'
+                )
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
 
         if self._is_ref:
@@ -351,7 +365,22 @@ class ActorRolloutRefWorker(Worker):
                                                                trust_remote_code=self.config.model.get(
                                                                    'trust_remote_code', False))[0]
             if self._is_offload_param:
+                log_gpu_memory_usage(
+                    'Before offload reference params during init',
+                    logger=None,
+                )
                 offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                log_gpu_memory_usage(
+                    'After offload reference params during init',
+                    logger=None,
+                )
+                if self.rank == 0:
+                    print(
+                        'Reference FSDP storage after init offload: '
+                        f'{format_fsdp_model_device_summary(self.ref_module_fsdp)}'
+                    )
 
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
