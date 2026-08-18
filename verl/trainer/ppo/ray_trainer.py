@@ -680,6 +680,7 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         optimizer_steps = 0
         max_optimizer_steps = self.config.trainer.get('max_optimizer_steps', None)
+        val_after_train = self.config.trainer.get('val_after_train', True)
 
         # Agent config preparation
         gen_config = GenerationConfig(
@@ -854,7 +855,7 @@ class RayPPOTrainer(object):
                 self.global_steps += 1
 
                 if max_optimizer_steps is not None and optimizer_steps >= max_optimizer_steps:
-                    if self.val_reward_fn is not None:
+                    if self.val_reward_fn is not None and val_after_train:
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
@@ -863,7 +864,7 @@ class RayPPOTrainer(object):
                 if max_optimizer_steps is None and self.global_steps >= self.total_training_steps:
 
                     # perform validation after training
-                    if self.val_reward_fn is not None:
+                    if self.val_reward_fn is not None and val_after_train:
                         val_metrics = self._validate()
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
