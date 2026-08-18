@@ -313,9 +313,20 @@ class ActorRolloutRefWorker(Worker):
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
             if self._is_offload_param:
-                # param is require during state_dict in sharding manager
-                offload_fsdp_grad(module=self.actor_module_fsdp)
-                log_gpu_memory_usage('After offload actor grad during init', logger=logger)
+                # Free actor parameter memory before constructing the colocated
+                # vLLM rollout engine. On a single GPU, FSDP falls back to
+                # NO_SHARD, so keeping the actor resident while vLLM creates
+                # its inference copy can exhaust GPU memory.
+                offload_fsdp_param_and_grad(
+                    module=self.actor_module_fsdp,
+                    offload_grad=self._is_offload_grad,
+                )
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                log_gpu_memory_usage(
+                    'After offload actor params during init',
+                    logger=logger,
+                )
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
