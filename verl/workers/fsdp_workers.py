@@ -325,20 +325,32 @@ class ActorRolloutRefWorker(Worker):
                     module=self.actor_module_fsdp,
                     offload_grad=self._is_offload_grad,
                 )
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
                 log_gpu_memory_usage(
-                    'After offload actor params during init',
+                    'Immediately after actor offload before synchronize during init',
                     logger=None,
                 )
                 if self.rank == 0:
                     print(
-                        'Actor FSDP storage after init offload: '
+                        'Actor FSDP storage after offload before synchronize: '
                         f'{format_fsdp_model_device_summary(self.actor_module_fsdp)}'
                     )
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-                log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
+            if self._is_offload_param or self._is_offload_optimizer:
+                # The model and optimizer helpers intentionally enqueue
+                # non-blocking copies. Synchronize once at this lifecycle
+                # boundary before constructing the colocated vLLM model.
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                log_gpu_memory_usage(
+                    'After synchronize and empty_cache for actor offload during init',
+                    logger=None,
+                )
+                if self._is_offload_param and self.rank == 0:
+                    print(
+                        'Actor FSDP storage after synchronize and empty_cache: '
+                        f'{format_fsdp_model_device_summary(self.actor_module_fsdp)}'
+                    )
         # load from checkpoint
         if self._is_actor:
             OmegaConf.set_struct(self.config.actor, True)
@@ -370,15 +382,24 @@ class ActorRolloutRefWorker(Worker):
                     logger=None,
                 )
                 offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
                 log_gpu_memory_usage(
-                    'After offload reference params during init',
+                    'Immediately after reference offload before synchronize during init',
                     logger=None,
                 )
                 if self.rank == 0:
                     print(
-                        'Reference FSDP storage after init offload: '
+                        'Reference FSDP storage after offload before synchronize: '
+                        f'{format_fsdp_model_device_summary(self.ref_module_fsdp)}'
+                    )
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                log_gpu_memory_usage(
+                    'After synchronize and empty_cache for reference offload during init',
+                    logger=None,
+                )
+                if self.rank == 0:
+                    print(
+                        'Reference FSDP storage after synchronize and empty_cache: '
                         f'{format_fsdp_model_device_summary(self.ref_module_fsdp)}'
                     )
 

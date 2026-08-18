@@ -193,15 +193,27 @@ def _tensor_storage_nbytes(tensor):
 
 
 def get_fsdp_model_device_summary(module):
-    """Return tensor-storage totals by FSDP alias and device for diagnostics."""
+    """Return tensor-storage totals by FSDP alias and device for diagnostics.
+
+    ``use_orig_params=False`` FSDP modules also expose unregistered Tensor
+    views on their wrapped submodules. Those views do not appear in
+    ``named_parameters()``, but may keep a previous flat-parameter storage
+    alive after the canonical ``FlatParameter`` storage is rebound.
+    """
     summary = {}
 
-    def record(category, tensor):
+    def record(category, tensor, use_storage_nbytes=True):
         if tensor is None or not hasattr(tensor, "device"):
             return
         device = str(tensor.device)
         entry = summary.setdefault(category, {}).setdefault(device, {"bytes": 0, "tensors": 0})
-        entry["bytes"] += _tensor_storage_nbytes(tensor)
+        if use_storage_nbytes:
+            entry["bytes"] += _tensor_storage_nbytes(tensor)
+        else:
+            # Each unflattened parameter is a view into a handle's flat
+            # storage. Count logical tensor bytes to avoid counting the same
+            # underlying flat storage once per view.
+            entry["bytes"] += tensor.numel() * tensor.element_size()
         entry["tensors"] += 1
 
     for _, param in module.named_parameters():
@@ -223,6 +235,12 @@ def get_fsdp_model_device_summary(module):
         flat_param = handle.flat_param
         for category, attribute in handle_tensor_attrs:
             record(category, getattr(flat_param, attribute, None))
+        for param_name, param_module, _ in getattr(flat_param, "_param_infos", ()):
+            record(
+                "unflattened_param_view",
+                getattr(param_module, param_name, None),
+                use_storage_nbytes=False,
+            )
 
     return summary
 

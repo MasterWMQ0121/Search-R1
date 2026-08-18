@@ -61,6 +61,15 @@ class _FakeTensor:
     def size(self):
         return self.shape
 
+    def numel(self):
+        result = 1
+        for dimension in self.shape:
+            result *= dimension
+        return result
+
+    def element_size(self):
+        return self.storage.nbytes() // self.numel()
+
     def untyped_storage(self):
         return self.storage
 
@@ -69,6 +78,9 @@ class _FakeFlatParameter:
     def __init__(self, device):
         self._storage = _FakeStorage(device)
         self._local_shard = self.data
+        self._unflattened_module = type("FakeModule", (), {})()
+        self._unflattened_module.weight = self.data
+        self._param_infos = (("weight", self._unflattened_module, ""),)
         self.grad = None
 
     @property
@@ -179,7 +191,7 @@ def test_fsdp_model_offload_does_not_override_native_cpu_offload_handles():
     assert handle.moves == []
 
 
-def test_fsdp_storage_summary_reports_canonical_alias_devices():
+def test_fsdp_storage_summary_reports_canonical_and_unflattened_view_devices():
     fake_torch = _FakeTorch()
     offload_model, storage_nbytes, get_summary, format_summary = _load_fsdp_utils_functions(
         "offload_fsdp_model_to_cpu",
@@ -198,9 +210,10 @@ def test_fsdp_storage_summary_reports_canonical_alias_devices():
     assert summary["parameter_data"]["cpu"]["bytes"] == 4096
     assert summary["flat_param_data"]["cpu"]["bytes"] == 4096
     assert summary["flat_param_local_shard"]["cpu"]["bytes"] == 4096
-    assert "cuda" not in formatted
+    assert summary["unflattened_param_view"]["cuda:0"]["bytes"] == 4096
     assert "parameter_data[cpu=" in formatted
     assert "flat_param_local_shard[cpu=" in formatted
+    assert "unflattened_param_view[cuda:0=" in formatted
 
 
 def test_existing_param_and_grad_entrypoints_delegate_to_fsdp_handle_helpers():
@@ -238,6 +251,40 @@ def test_actor_params_are_offloaded_before_rollout_build():
     assert offload_line < rollout_line
 
 
+def test_actor_init_synchronizes_once_after_parameter_and_optimizer_offload():
+    tree = ast.parse(WORKER_SOURCE)
+    init_model = next(
+        node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "init_model"
+    )
+    calls = [node for node in ast.walk(init_model) if isinstance(node, ast.Call)]
+
+    actor_param_offload_line = min(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "offload_fsdp_param_and_grad"
+    )
+    actor_optimizer_offload_line = min(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Name) and node.func.id == "offload_fsdp_optimizer"
+    )
+    synchronize_line = min(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Attribute)
+        and node.func.attr == "synchronize"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "cuda"
+    )
+    rollout_line = min(
+        node.lineno
+        for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "_build_rollout"
+    )
+
+    assert actor_param_offload_line < actor_optimizer_offload_line < synchronize_line < rollout_line
+
+
 def test_colocated_reference_is_initialized_before_actor_rollout():
     assert "create_colocated_worker_cls(class_dict=class_dict)" in RAY_TRAINER_SOURCE
     assert RAY_TRAINER_SOURCE.index("self.ref_policy_wg.init_model()") < RAY_TRAINER_SOURCE.index(
@@ -248,10 +295,15 @@ def test_colocated_reference_is_initialized_before_actor_rollout():
 def test_init_and_vllm_construction_have_visible_memory_boundaries():
     for expected in (
         "Before offload reference params during init",
-        "After offload reference params during init",
-        "Reference FSDP storage after init offload",
+        "Immediately after reference offload before synchronize during init",
+        "After synchronize and empty_cache for reference offload during init",
+        "Reference FSDP storage after offload before synchronize",
+        "Reference FSDP storage after synchronize and empty_cache",
         "Before offload actor params during init",
-        "After offload actor params during init",
+        "Immediately after actor offload before synchronize during init",
+        "After synchronize and empty_cache for actor offload during init",
+        "Actor FSDP storage after offload before synchronize",
+        "Actor FSDP storage after synchronize and empty_cache",
         "Actor FSDP storage immediately before rollout build",
     ):
         assert expected in WORKER_SOURCE
