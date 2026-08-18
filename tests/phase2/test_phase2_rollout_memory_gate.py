@@ -7,7 +7,8 @@ SCRIPT = SCRIPT_PATH.read_text(encoding="utf-8")
 
 
 def test_phase2_gate_is_isolated_and_reuses_phase1_fixture():
-    assert 'BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"' in SCRIPT
+    assert 'BASE_MODEL="${PHASE2_MODEL_PATH:-Qwen/Qwen2.5-3B-Instruct}"' in SCRIPT
+    assert 'actor_rollout_ref.model.path="${BASE_MODEL}"' in SCRIPT
     assert 'DATA_DIR="${PHASE1_DATA_DIR:-${ROOT_DIR}/data/phase1_smoke}"' in SCRIPT
     assert 'data.train_files="${DATA_DIR}/train.parquet"' in SCRIPT
     assert 'data.val_files="${DATA_DIR}/test.parquet"' in SCRIPT
