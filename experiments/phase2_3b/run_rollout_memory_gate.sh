@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DATA_DIR="${PHASE1_DATA_DIR:-${ROOT_DIR}/data/phase1_smoke}"
 PYTHON_BIN="${PHASE2_PYTHON:-python3}"
 RETRIEVER_URL="${PHASE2_RETRIEVER_URL:-http://127.0.0.1:8000/retrieve}"
-BASE_MODEL="Qwen/Qwen2.5-3B-Instruct"
+BASE_MODEL="${PHASE2_MODEL_PATH:-Qwen/Qwen2.5-3B-Instruct}"
 EXPERIMENT_NAME="phase2-qwen2.5-3b-rollout-memory-gate"
 LOG_PATH="${PHASE2_LOG_PATH:-${ROOT_DIR}/${EXPERIMENT_NAME}.log}"
 
