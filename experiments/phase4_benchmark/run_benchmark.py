@@ -7,10 +7,14 @@ import json
 import math
 import os
 import time
+import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
 from types import MethodType
 
+import numpy as np
 import pandas as pd
 
 from experiments.phase4_benchmark.prepare_eval_data import sha256_file
@@ -529,12 +533,168 @@ def _meta_item(meta_info, key, default):
     return value[0]
 
 
+def _token_id_error(label, token_ids, reason):
+    value_type = f"{type(token_ids).__module__}.{type(token_ids).__name__}"
+    dtype = getattr(token_ids, "dtype", None)
+    shape = getattr(token_ids, "shape", None)
+    if shape is not None:
+        try:
+            shape = tuple(shape)
+        except TypeError:
+            shape = repr(shape)
+    try:
+        sample_source = token_ids.detach().cpu().tolist()
+    except AttributeError:
+        try:
+            sample_source = token_ids.tolist()
+        except AttributeError:
+            try:
+                sample_source = list(token_ids)
+            except TypeError:
+                sample_source = token_ids
+    sample = sample_source[:8] if isinstance(sample_source, list) else sample_source
+    raise ValueError(
+        f"{label}: {reason}; type={value_type}, dtype={dtype!s}, "
+        f"shape={shape!r}, sample={sample!r}"
+    )
+
+
+def _normalize_token_ids_for_decode(token_ids, label):
+    """Validate one token-ID row and return plain Python integers for decoding."""
+    import torch
+
+    original = token_ids
+    float_exact_limit = None
+    float_dtype_label = None
+    if isinstance(token_ids, torch.Tensor):
+        token_ids = token_ids.detach().cpu()
+        if token_ids.ndim != 1:
+            _token_id_error(label, original, "expected a one-dimensional token-ID row")
+        if token_ids.dtype == torch.bool:
+            _token_id_error(label, original, "boolean token IDs are not allowed")
+        if token_ids.dtype.is_floating_point:
+            if token_ids.dtype == torch.float32:
+                float_exact_limit = 1 << 24
+            elif token_ids.dtype == torch.float64:
+                float_exact_limit = 1 << 53
+            else:
+                _token_id_error(
+                    label,
+                    original,
+                    "low-precision or unsupported floating token IDs may already "
+                    "have lost integer identity and cannot be safely normalized; "
+                    "only float32 and float64 are accepted",
+                )
+            float_dtype_label = str(token_ids.dtype)
+        values = token_ids.tolist()
+    elif isinstance(token_ids, np.ndarray):
+        if token_ids.ndim != 1:
+            _token_id_error(label, original, "expected a one-dimensional token-ID row")
+        if token_ids.dtype == np.dtype(np.bool_):
+            _token_id_error(label, original, "boolean token IDs are not allowed")
+        try:
+            is_floating_dtype = np.issubdtype(token_ids.dtype, np.floating)
+        except TypeError:
+            is_floating_dtype = False
+        is_floating_dtype = is_floating_dtype or "float" in str(token_ids.dtype).lower()
+        if is_floating_dtype:
+            if token_ids.dtype == np.dtype(np.float32):
+                float_exact_limit = 1 << 24
+            elif token_ids.dtype == np.dtype(np.float64):
+                float_exact_limit = 1 << 53
+            else:
+                _token_id_error(
+                    label,
+                    original,
+                    "low-precision or unsupported floating token IDs may already "
+                    "have lost integer identity and cannot be safely normalized; "
+                    "only float32 and float64 are accepted",
+                )
+            float_dtype_label = str(token_ids.dtype)
+        values = token_ids.tolist()
+    elif isinstance(token_ids, Sequence) and not isinstance(
+        token_ids, (str, bytes, bytearray)
+    ):
+        values = list(token_ids)
+    else:
+        _token_id_error(label, original, "expected a tensor, array, or sequence")
+
+    normalized = []
+    int64_max = (1 << 63) - 1
+    sequence_float_dtypes = set()
+    for value in values:
+        if isinstance(value, (bool, np.bool_)):
+            _token_id_error(label, original, "boolean token IDs are not allowed")
+        if isinstance(value, Integral):
+            normalized_value = int(value)
+        elif isinstance(value, (float, np.floating)):
+            value_exact_limit = float_exact_limit
+            if value_exact_limit is None:
+                if isinstance(value, np.floating):
+                    value_dtype = np.asarray(value).dtype
+                    if value_dtype == np.dtype(np.float32):
+                        value_exact_limit = 1 << 24
+                    elif value_dtype == np.dtype(np.float64):
+                        value_exact_limit = 1 << 53
+                    else:
+                        _token_id_error(
+                            label,
+                            original,
+                            "low-precision or unsupported floating token IDs may "
+                            "already have lost integer identity and cannot be safely "
+                            "normalized; only float32 and float64 are accepted",
+                        )
+                    sequence_float_dtypes.add(str(value_dtype))
+                else:
+                    value_exact_limit = 1 << 53
+                    sequence_float_dtypes.add("python.float64")
+            numeric_value = float(value)
+            if not math.isfinite(numeric_value):
+                _token_id_error(label, original, "floating token IDs must be finite")
+            if numeric_value < 0:
+                _token_id_error(label, original, "negative token IDs are not allowed")
+            if not numeric_value.is_integer():
+                _token_id_error(
+                    label, original, "floating token IDs must be exactly integer-valued"
+                )
+            if abs(numeric_value) > value_exact_limit:
+                _token_id_error(
+                    label,
+                    original,
+                    "floating token IDs exceed the source dtype's exact consecutive-"
+                    f"integer range (absolute value must be <= {value_exact_limit})",
+                )
+            normalized_value = int(numeric_value)
+        else:
+            _token_id_error(label, original, f"token ID {value!r} is not numeric")
+        if normalized_value < 0:
+            _token_id_error(label, original, "negative token IDs are not allowed")
+        if normalized_value > int64_max:
+            _token_id_error(label, original, "token IDs must fit in signed int64")
+        normalized.append(normalized_value)
+
+    if float_dtype_label is not None or sequence_float_dtypes:
+        dtype_description = float_dtype_label or ",".join(sorted(sequence_float_dtypes))
+        shape = getattr(original, "shape", (len(values),))
+        shape = tuple(shape)
+        warnings.warn(
+            f"{label}: dtype={dtype_description}, shape={shape}; exact integer-valued "
+            "token IDs are being normalized to int64",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return normalized
+
+
 def _decode_search_trajectory(tokenizer, output):
     responses = output.batch["responses"][0]
     prompt_length = output.batch["prompts"].shape[-1]
     response_mask = output.batch["attention_mask"][0, prompt_length:]
     valid_length = int(response_mask.sum().item())
-    return tokenizer.decode(responses[:valid_length], skip_special_tokens=True)
+    token_ids = _normalize_token_ids_for_decode(
+        responses[:valid_length], "Search-RL trajectory responses"
+    )
+    return tokenizer.decode(token_ids, skip_special_tokens=True)
 
 
 def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,

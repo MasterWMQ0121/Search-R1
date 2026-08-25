@@ -1,13 +1,16 @@
 import json
 from pathlib import Path
 import subprocess
+import warnings
 
+import numpy as np
 import pytest
 import torch
 
 from experiments.phase4_benchmark import run_benchmark as benchmark
 from experiments.phase4_benchmark import summarize_results as summary
 import search_r1.llm_agent.generation as agent_generation
+from verl import DataProto
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +50,30 @@ class FakeTokenizer:
 
     def batch_decode(self, token_rows, skip_special_tokens=True):
         return [self.decode(row, skip_special_tokens=skip_special_tokens) for row in token_rows]
+
+
+class StrictDecodeTokenizer(FakeTokenizer):
+    def __init__(self):
+        self.decode_inputs = []
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        token_ids = list(token_ids)
+        if any(type(token_id) is not int for token_id in token_ids):
+            raise TypeError("strict tokenizer requires plain Python integer token IDs")
+        self.decode_inputs.append(token_ids)
+        return "".join(chr(token_id) for token_id in token_ids if token_id)
+
+    def batch_decode(self, token_rows, skip_special_tokens=True):
+        decoded = []
+        for row in token_rows:
+            if isinstance(row, torch.Tensor):
+                row = row.detach().cpu().tolist()
+            else:
+                row = list(row)
+            if any(type(token_id) is not int for token_id in row):
+                raise TypeError("strict tokenizer requires integer token IDs")
+            decoded.append("".join(chr(token_id) for token_id in row if token_id))
+        return decoded
 
 
 class FakeGenerator:
@@ -140,6 +167,180 @@ def _record(mode, uid, source, exact_match, latency, **updates):
     return record
 
 
+def _search_output(response_ids, valid_length=None):
+    if not isinstance(response_ids, torch.Tensor):
+        response_ids = torch.tensor(response_ids)
+    if response_ids.ndim != 1:
+        raise ValueError("test response IDs must be one-dimensional")
+    if valid_length is None:
+        valid_length = response_ids.shape[0]
+    prompts = torch.tensor([[11, 12]], dtype=torch.long)
+    response_mask = torch.zeros((1, response_ids.shape[0]), dtype=torch.long)
+    response_mask[:, :valid_length] = 1
+    return DataProto.from_dict({
+        "prompts": prompts,
+        "responses": response_ids.unsqueeze(0),
+        "attention_mask": torch.cat(
+            [torch.ones_like(prompts), response_mask], dim=1
+        ),
+    })
+
+
+def test_search_trajectory_decode_preserves_long_token_ids_and_order():
+    tokenizer = StrictDecodeTokenizer()
+    token_ids = [ord(character) for character in "<answer>Paris</answer>"]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        trajectory = benchmark._decode_search_trajectory(
+            tokenizer, _search_output(torch.tensor(token_ids, dtype=torch.long))
+        )
+
+    assert trajectory == "<answer>Paris</answer>"
+    assert tokenizer.decode_inputs == [token_ids]
+    assert not [warning for warning in caught if warning.category is RuntimeWarning]
+
+
+def test_search_trajectory_decode_accepts_integer_valued_float_ids():
+    tokenizer = StrictDecodeTokenizer()
+    token_ids = [ord(character) for character in "<answer>Paris</answer>"]
+
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"Search-RL trajectory responses: dtype=torch.float32, shape=.*"
+        r"exact integer-valued token IDs are being normalized to int64",
+    ) as caught:
+        trajectory = benchmark._decode_search_trajectory(
+            tokenizer, _search_output(torch.tensor(token_ids, dtype=torch.float32))
+        )
+
+    assert trajectory == "<answer>Paris</answer>"
+    assert tokenizer.decode_inputs == [token_ids]
+    assert len(caught) == 1
+
+
+@pytest.mark.parametrize(
+    "token_ids",
+    [
+        torch.tensor([65.0], dtype=torch.float16),
+        torch.tensor([65.0], dtype=torch.bfloat16),
+        np.array([65.0], dtype=np.float16),
+    ],
+)
+def test_token_id_normalization_rejects_lossy_float_dtypes(token_ids):
+    with pytest.raises(ValueError, match="may already have lost integer identity") as error:
+        benchmark._normalize_token_ids_for_decode(token_ids, "lossy token IDs")
+
+    error_text = str(error.value)
+    assert "lossy token IDs" in error_text
+    assert "dtype=" in error_text
+    assert "shape=" in error_text
+    assert "sample=" in error_text
+
+
+@pytest.mark.parametrize(
+    "token_ids",
+    [
+        torch.tensor([0, 1 << 24], dtype=torch.float32),
+        np.array([0, 1 << 24], dtype=np.float32),
+    ],
+)
+def test_float32_token_ids_within_exact_integer_range_succeed(token_ids):
+    with pytest.warns(RuntimeWarning, match="normalized to int64"):
+        normalized = benchmark._normalize_token_ids_for_decode(
+            token_ids, "float32 token IDs"
+        )
+
+    assert normalized == [0, 1 << 24]
+    assert all(type(token_id) is int for token_id in normalized)
+
+
+@pytest.mark.parametrize(
+    "token_ids",
+    [
+        torch.tensor([float((1 << 24) + 2)], dtype=torch.float32),
+        np.array([float((1 << 24) + 2)], dtype=np.float32),
+    ],
+)
+def test_float32_token_ids_outside_exact_integer_range_fail(token_ids):
+    with pytest.raises(ValueError, match="exact consecutive-integer range"):
+        benchmark._normalize_token_ids_for_decode(token_ids, "float32 token IDs")
+
+
+@pytest.mark.parametrize(
+    "token_ids",
+    [
+        torch.tensor([0, 1 << 53], dtype=torch.float64),
+        np.array([0, 1 << 53], dtype=np.float64),
+    ],
+)
+def test_float64_token_ids_within_exact_integer_range_succeed(token_ids):
+    with pytest.warns(RuntimeWarning, match="normalized to int64"):
+        normalized = benchmark._normalize_token_ids_for_decode(
+            token_ids, "float64 token IDs"
+        )
+
+    assert normalized == [0, 1 << 53]
+    assert all(type(token_id) is int for token_id in normalized)
+
+
+@pytest.mark.parametrize(
+    "token_ids",
+    [
+        torch.tensor([float((1 << 53) + 2)], dtype=torch.float64),
+        np.array([float((1 << 53) + 2)], dtype=np.float64),
+    ],
+)
+def test_float64_token_ids_outside_exact_integer_range_fail(token_ids):
+    with pytest.raises(ValueError, match="exact consecutive-integer range"):
+        benchmark._normalize_token_ids_for_decode(token_ids, "float64 token IDs")
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "message"),
+    [
+        (torch.tensor([65.5], dtype=torch.float32), "exactly integer-valued"),
+        (torch.tensor([float("nan")], dtype=torch.float32), "must be finite"),
+        (torch.tensor([float("inf")], dtype=torch.float32), "must be finite"),
+        (torch.tensor([-1], dtype=torch.long), "negative token IDs"),
+        (torch.tensor([True], dtype=torch.bool), "boolean token IDs"),
+    ],
+)
+def test_search_trajectory_decode_rejects_invalid_token_ids(token_ids, message):
+    tokenizer = StrictDecodeTokenizer()
+
+    with pytest.raises(ValueError, match=message) as error:
+        benchmark._decode_search_trajectory(tokenizer, _search_output(token_ids))
+
+    error_text = str(error.value)
+    assert "Search-RL trajectory responses" in error_text
+    assert "dtype=" in error_text
+    assert "shape=" in error_text
+    assert "sample=" in error_text
+    assert tokenizer.decode_inputs == []
+
+
+def test_search_trajectory_decode_handles_zero_valid_tokens_explicitly():
+    tokenizer = StrictDecodeTokenizer()
+
+    trajectory = benchmark._decode_search_trajectory(
+        tokenizer,
+        _search_output(torch.tensor([65], dtype=torch.long), valid_length=0),
+    )
+
+    assert trajectory == ""
+    assert tokenizer.decode_inputs == [[]]
+
+
+def test_search_trajectory_decode_rejects_multidimensional_token_ids():
+    tokenizer = StrictDecodeTokenizer()
+    output = _search_output(torch.tensor([65], dtype=torch.long))
+    output.batch["responses"] = torch.tensor([[[65]]], dtype=torch.long)
+
+    with pytest.raises(ValueError, match="one-dimensional"):
+        benchmark._decode_search_trajectory(tokenizer, output)
+
+
 def test_static_rag_uses_exactly_one_retrieval_and_shared_em_semantics():
     tokenizer = FakeTokenizer()
     generator = FakeGenerator(["<think>known</think><answer>Paris</answer>"])
@@ -200,6 +401,76 @@ def test_search_rl_mode_reuses_existing_agent_loop_and_reports_metrics(monkeypat
     assert result["search_retrieval_failure_count"] == 0
     assert len(result["retrieved_observation_lengths_before_truncation"]) == 1
     benchmark.validate_result_record(result, "search_rl")
+
+
+def test_search_rl_full_flow_decodes_integer_valued_float_output(monkeypatch):
+    tokenizer = StrictDecodeTokenizer()
+    generator = FakeGenerator([
+        "<think>need evidence</think><search>capital of France</search>",
+        "<think>use evidence</think><answer>Paris</answer>",
+    ])
+    retrieval_calls = []
+
+    def fake_batch_search(self, queries):
+        retrieval_calls.append(queries)
+        passages = [
+            {
+                "document": {
+                    "id": f"doc-{index}",
+                    "contents": f"Title {index}\nParis evidence.",
+                },
+                "score": 1.0 - index / 10,
+            }
+            for index in range(3)
+        ]
+        return {"result": [passages for _query in queries]}
+
+    original_run_llm_loop = agent_generation.LLMGenerationManager.run_llm_loop
+    observed = {}
+
+    def run_llm_loop_with_float_responses(self, gen_batch, initial_input_ids):
+        output = original_run_llm_loop(self, gen_batch, initial_input_ids)
+        observed["source_dtype"] = output.batch["responses"].dtype
+        output.batch["responses"] = output.batch["responses"].to(torch.float32)
+        observed["decode_boundary_dtype"] = output.batch["responses"].dtype
+        return output
+
+    monkeypatch.setattr(
+        agent_generation.LLMGenerationManager, "_batch_search", fake_batch_search
+    )
+    monkeypatch.setattr(
+        agent_generation.LLMGenerationManager,
+        "run_llm_loop",
+        run_llm_loop_with_float_responses,
+    )
+
+    with pytest.warns(
+        RuntimeWarning,
+        match=r"Search-RL trajectory responses: dtype=torch.float32, shape=.*"
+        r"exact integer-valued token IDs are being normalized to int64",
+    ) as caught:
+        result = benchmark.evaluate_search_rl(
+            _example(), tokenizer, generator, "trained-model", "http://retriever/retrieve"
+        )
+
+    assert observed == {
+        "source_dtype": torch.int64,
+        "decode_boundary_dtype": torch.float32,
+    }
+    assert len(caught) == 1
+    assert len(generator.calls) == 2
+    assert retrieval_calls == [["capital of France"]]
+    assert result["prediction"] == "Paris"
+    assert result["exact_match"] == 1
+    assert result["number_of_actions"] == 2
+    assert result["number_of_valid_searches"] == 1
+    assert all(
+        type(token_id) is int
+        for decode_input in tokenizer.decode_inputs
+        for token_id in decode_input
+    )
+    assert "<search>capital of France</search>" in result["trajectory"]
+    assert result["trajectory"].endswith("<answer>Paris</answer>")
 
 
 def test_result_schema_rejects_static_rag_without_exactly_one_retrieval():
