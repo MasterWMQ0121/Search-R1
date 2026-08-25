@@ -44,17 +44,22 @@ recorded for every example.
 
 ## Held-out preparation and overlap guarantee
 
-`prepare_eval_data.py` reads the original source test parquet and the exact
-prepared artifacts used by Phase 2 and Phase 3. Before selecting anything it:
+`prepare_eval_data.py` reads the original complete multi-dataset source test
+parquet and the exact prepared artifacts used by Phase 2 and Phase 3. The
+source file includes QA datasets beyond NQ and HotpotQA; Phase 4 intentionally
+uses only those two target sources and records counts for every ignored source
+in `manifest.json`. Before selecting anything it:
 
 1. verifies the source and prepared parquet SHA256 values against both
    manifests;
-2. constructs source-aware UIDs as `lowercase(data_source):extra_info.index`;
+2. constructs source-aware UIDs as `lowercase(data_source):extra_info.index`
+   for NQ and HotpotQA while retaining positions from the complete parquet;
 3. excludes the Phase-2 training UIDs and the Phase-3 training and validation
    UIDs;
 4. excludes Phase-2/3 test source positions using the stronger physical
    identity `(source SHA256, test split, source position)`;
-5. rejects missing/duplicate UIDs and known Phase-1 fixture markers; and
+5. rejects missing/duplicate target-source UIDs, unsupported sources in all
+   prepared/reference selections, and known Phase-1 fixture markers; and
 6. shuffles the remaining NQ and HotpotQA pools deterministically, takes 32 of
    each, and interleaves them.
 

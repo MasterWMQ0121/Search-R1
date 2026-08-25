@@ -66,13 +66,30 @@ def _write_fixture(
     duplicate_source_uid=False,
     missing_source_index=False,
     leakage_marker=None,
+    mixed_source=False,
 ):
-    source_rows = [_row("nq", index) for index in range(source_count)]
-    source_rows += [_row("hotpotqa", index) for index in range(source_count)]
+    if mixed_source:
+        source_rows = []
+        for index in range(source_count):
+            source_rows.extend([
+                _row("nq", index),
+                _row("triviaqa", index),
+                _row("hotpotqa", index),
+                _row("popqa", index),
+            ])
+        duplicate_position = 4
+        phase2_test_positions = [8, 10]
+        phase3_test_positions = [0, 4, 2, 6]
+    else:
+        source_rows = [_row("nq", index) for index in range(source_count)]
+        source_rows += [_row("hotpotqa", index) for index in range(source_count)]
+        duplicate_position = 1
+        phase2_test_positions = [2, source_count + 2]
+        phase3_test_positions = [0, 1, source_count, source_count + 1]
     if duplicate_source_uid:
-        source_rows[1] = _row("nq", 0)
+        source_rows[duplicate_position] = _row("nq", 0)
     if missing_source_index:
-        source_rows[1]["extra_info"]["index"] = None
+        source_rows[duplicate_position]["extra_info"]["index"] = None
     if leakage_marker is not None:
         for row in source_rows:
             row["prompt"][0]["content"] = leakage_marker
@@ -90,8 +107,6 @@ def _write_fixture(
         _row("hotpotqa", 103, split="train"),
     ])
 
-    phase2_test_positions = [2, source_count + 2]
-    phase3_test_positions = [0, 1, source_count, source_count + 1]
     phase3_test_frame = source_frame.iloc[phase3_test_positions].copy()
 
     phase2_train = tmp_path / "phase2-train.parquet"
@@ -218,6 +233,73 @@ def test_phase4_selector_is_deterministic_balanced_non_overlapping_and_preserves
     assert on_disk["output"]["sha256"] == PREPARE.sha256_file(output_a / "eval.parquet")
 
 
+def test_phase4_selector_filters_mixed_source_pool_without_changing_positions(tmp_path):
+    fixture = _write_fixture(tmp_path, mixed_source=True)
+    output_a = tmp_path / "output-a"
+    output_b = tmp_path / "output-b"
+
+    manifest_a = _prepare(fixture, output_a)
+    manifest_b = _prepare(fixture, output_b)
+    output_frame = pd.read_parquet(output_a / "eval.parquet")
+
+    assert manifest_a["data_source_counts"] == {"nq": 4, "hotpotqa": 4}
+    assert set(output_frame["data_source"]) == {"nq", "hotpotqa"}
+    assert manifest_a["source_filter"] == {
+        "target_sources": ["nq", "hotpotqa"],
+        "ignored_source_counts": {"popqa": 48, "triviaqa": 48},
+        "ignored_row_count": 96,
+    }
+    assert manifest_a["source_test"]["sha256"] == PREPARE.sha256_file(
+        fixture["source_test"]
+    )
+    assert manifest_a["output"]["sha256"] == manifest_b["output"]["sha256"]
+    assert (output_a / "eval.parquet").read_bytes() == (
+        output_b / "eval.parquet"
+    ).read_bytes()
+
+    selected_positions = {
+        record["source_position"] for record in manifest_a["selected_source_rows"]
+    }
+    excluded_positions = (
+        fixture["phase2_test_positions"] | fixture["phase3_test_positions"]
+    )
+    assert selected_positions.isdisjoint(excluded_positions)
+    assert all(position % 4 in (0, 2) for position in selected_positions)
+    selected_uids = {record["uid"] for record in manifest_a["selected_source_rows"]}
+    assert "nq:3" not in selected_uids
+    assert "nq:4" not in selected_uids
+    for output_position, record in enumerate(manifest_a["selected_source_rows"]):
+        original = fixture["source_frame"].iloc[record["source_position"]].to_dict()
+        selected = output_frame.iloc[output_position].to_dict()
+        assert _normalized(selected) == _normalized(original)
+
+
+def test_phase4_selector_ignores_non_target_identity_details(tmp_path):
+    fixture = _write_fixture(tmp_path, mixed_source=True)
+    source_frame = pd.read_parquet(fixture["source_test"])
+    source_frame.at[5, "extra_info"] = source_frame.iloc[1]["extra_info"]
+    source_frame.at[3, "extra_info"] = {}
+    source_frame.to_parquet(fixture["source_test"], index=False)
+    source_sha = PREPARE.sha256_file(fixture["source_test"])
+    for manifest_name in ("phase2_manifest", "phase3_manifest"):
+        metadata = json.loads(fixture[manifest_name].read_text(encoding="utf-8"))
+        metadata["source_sha256"]["test"] = source_sha
+        fixture[manifest_name].write_text(json.dumps(metadata), encoding="utf-8")
+
+    manifest = _prepare(fixture, tmp_path / "output")
+    assert manifest["source_filter"]["ignored_row_count"] == 96
+
+
+def test_phase4_selector_verifies_full_mixed_source_sha(tmp_path):
+    fixture = _write_fixture(tmp_path, mixed_source=True)
+    fixture["source_test"].write_bytes(
+        fixture["source_test"].read_bytes() + b"tampered"
+    )
+
+    with pytest.raises(ValueError, match="source test SHA256 mismatch"):
+        _prepare(fixture, tmp_path / "output")
+
+
 @pytest.mark.parametrize("artifact", ["source_test", "phase2_train", "phase3_train", "phase3_test"])
 def test_phase4_selector_rejects_hash_mismatches_before_writing(artifact, tmp_path):
     fixture = _write_fixture(tmp_path)
@@ -240,6 +322,47 @@ def test_phase4_selector_rejects_duplicate_or_missing_source_identity(failure, t
 
     expected = "duplicate data_source:index identity" if failure == "duplicate" else "invalid extra_info.index"
     with pytest.raises(ValueError, match=expected):
+        _prepare(fixture, tmp_path / "output")
+
+
+def test_phase4_selector_rejects_duplicate_target_uid_in_mixed_source(tmp_path):
+    fixture = _write_fixture(tmp_path, mixed_source=True, duplicate_source_uid=True)
+    with pytest.raises(ValueError, match="duplicate data_source:index identity"):
+        _prepare(fixture, tmp_path / "output")
+
+
+@pytest.mark.parametrize(
+    ("artifact", "manifest_name", "split"),
+    [
+        ("phase2_train", "phase2_manifest", "train"),
+        ("phase3_train", "phase3_manifest", "train"),
+        ("phase3_test", "phase3_manifest", "test"),
+    ],
+)
+def test_phase4_selector_keeps_prepared_artifacts_strict(
+    artifact, manifest_name, split, tmp_path
+):
+    fixture = _write_fixture(tmp_path, mixed_source=True)
+    frame = pd.read_parquet(fixture[artifact])
+    frame.at[0, "data_source"] = "triviaqa"
+    frame.to_parquet(fixture[artifact], index=False)
+    metadata = json.loads(fixture[manifest_name].read_text(encoding="utf-8"))
+    metadata["output_sha256"][split] = PREPARE.sha256_file(fixture[artifact])
+    fixture[manifest_name].write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported data_source"):
+        _prepare(fixture, tmp_path / "output")
+
+
+def test_phase4_selector_keeps_manifest_referenced_source_rows_strict(tmp_path):
+    fixture = _write_fixture(tmp_path, mixed_source=True)
+    metadata = json.loads(fixture["phase2_manifest"].read_text(encoding="utf-8"))
+    metadata["selected_source_rows"]["test"][0] = _selection_entry(
+        fixture["source_frame"], 1, 0
+    )
+    fixture["phase2_manifest"].write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported data_source"):
         _prepare(fixture, tmp_path / "output")
 
 

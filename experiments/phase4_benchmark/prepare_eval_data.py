@@ -120,6 +120,43 @@ def _collect_identities(frame, label):
     return identities
 
 
+def _collect_source_pool_identities(frame, label):
+    """Collect target-source identities while retaining full-frame positions."""
+    _validate_schema(frame, label)
+    identities = []
+    seen = {}
+    ignored_source_counts = {}
+    for source_position in range(len(frame)):
+        row = frame.iloc[source_position]
+        source = str(row["data_source"]).strip().lower()
+        if source not in SUPPORTED_SOURCES:
+            ignored_source_counts[source] = ignored_source_counts.get(source, 0) + 1
+            continue
+
+        source, index, uid = _identity_from_row(
+            row, f"{label} row {source_position}"
+        )
+        if uid in seen:
+            raise ValueError(
+                f"{label} has duplicate data_source:index identity {uid!r} "
+                f"at rows {seen[uid]} and {source_position}"
+            )
+        seen[uid] = source_position
+        identities.append({
+            "source_position": source_position,
+            "source": source,
+            "index": index,
+            "uid": uid,
+        })
+
+    ignored_source_counts = dict(sorted(ignored_source_counts.items()))
+    return identities, {
+        "target_sources": list(SUPPORTED_SOURCES),
+        "ignored_source_counts": ignored_source_counts,
+        "ignored_row_count": sum(ignored_source_counts.values()),
+    }
+
+
 def _validate_selected_count(frame, manifest, split, label):
     expected = _expected_manifest_value(manifest, ["selected_row_counts", split], label)
     if int(expected) != len(frame):
@@ -269,7 +306,9 @@ def prepare_eval_data(
         phase3_test_frame, phase3_metadata, "test", "Phase-3 manifest"
     )
 
-    source_identities = _collect_identities(source_frame, "source test parquet")
+    source_identities, source_filter = _collect_source_pool_identities(
+        source_frame, "source test parquet"
+    )
     phase2_identities = _collect_identities(phase2_train_frame, "Phase-2 train parquet")
     phase3_train_identities = _collect_identities(
         phase3_train_frame, "Phase-3 train parquet"
@@ -295,7 +334,10 @@ def prepare_eval_data(
     excluded_test_positions = phase2_test_positions | phase3_test_positions
 
     candidates = {source: [] for source in SUPPORTED_SOURCES}
-    for position, identity in enumerate(source_identities):
+    source_identity_by_position = {}
+    for identity in source_identities:
+        position = identity["source_position"]
+        source_identity_by_position[position] = identity
         if position in excluded_test_positions or identity["uid"] in excluded_uids:
             continue
         candidates[identity["source"]].append(position)
@@ -321,10 +363,18 @@ def prepare_eval_data(
             selected_positions.append(selected_by_source[source][index])
 
     selected_frame = source_frame.iloc[selected_positions].copy()
+    selected_identities = _collect_identities(
+        selected_frame, "selected Phase-4 evaluation rows"
+    )
     selected_records = []
     selected_uids = set()
     for output_position, source_position in enumerate(selected_positions):
-        identity = source_identities[source_position]
+        identity = source_identity_by_position[source_position]
+        selected_identity = selected_identities[output_position]
+        if identity["uid"] != selected_identity["uid"]:
+            raise ValueError(
+                f"selected row {output_position} does not match source row {source_position}"
+            )
         uid = identity["uid"]
         if uid in selected_uids:
             raise ValueError(f"selected rows contain duplicate data_source:index identity {uid!r}")
@@ -367,6 +417,7 @@ def prepare_eval_data(
             "sha256": source_test_sha,
             "split": "test",
         },
+        "source_filter": source_filter,
         "reference_artifacts": {
             "phase2_train": {
                 "path": str(paths["phase2_train"]),
