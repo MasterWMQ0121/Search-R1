@@ -74,20 +74,37 @@ class LLMGenerationManager:
         responses = self._batch_tokenize(responses_str)
         return responses, responses_str
 
-    def _process_next_obs(self, next_obs: List[str]) -> torch.Tensor:
+    def _process_next_obs(self, next_obs: List[str], return_token_stats: bool = False):
         """Process next observations from environment."""
         
-        next_obs_ids = self.tokenizer(
+        tokenized_observations = self.tokenizer(
             next_obs, 
             padding='longest',
             return_tensors='pt',
             add_special_tokens=False,  # Prevents adding special tokens
-        )['input_ids']
+        )
+        next_obs_ids = tokenized_observations['input_ids']
+        next_obs_attention_mask = tokenized_observations['attention_mask']
+
+        observation_token_lengths = next_obs_attention_mask.sum(dim=1)
+        observation_token_excess = torch.clamp(
+            observation_token_lengths - self.config.max_obs_length,
+            min=0,
+        )
 
         if next_obs_ids.shape[1] > self.config.max_obs_length:
             print(f"[WARNING] OBSERVATION TOO LONG, CONSIDER CHANGING YOUR CONFIG, {next_obs_ids.shape[1]} & {self.config.max_obs_length}")            
             next_obs_ids = next_obs_ids[:, :self.config.max_obs_length]
+            next_obs_attention_mask = next_obs_attention_mask[:, :self.config.max_obs_length]
 
+        retained_observation_token_lengths = next_obs_attention_mask.sum(dim=1)
+        if return_token_stats:
+            return (
+                next_obs_ids,
+                observation_token_lengths,
+                retained_observation_token_lengths,
+                observation_token_excess,
+            )
         return next_obs_ids
 
     def _update_rolling_state(self, rollings: DataProto, cur_responses: torch.Tensor, 
@@ -228,6 +245,10 @@ class LLMGenerationManager:
         valid_action_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         valid_search_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         retrieval_success_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
+        retrieval_observation_token_lengths = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        retained_retrieval_observation_token_lengths = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        retrieval_observation_token_excess = [[] for _ in range(gen_batch.batch['input_ids'].shape[0])]
+        retrieval_observation_truncation_stats = torch.zeros(gen_batch.batch['input_ids'].shape[0], dtype=torch.int)
         active_num_list = [active_mask.sum().item()]
         rollings = gen_batch
 
@@ -265,7 +286,23 @@ class LLMGenerationManager:
             # returned search actions are completed retrievals at this boundary.
             retrieval_success_stats += torch.tensor(is_search, dtype=torch.int)
 
-            next_obs_ids = self._process_next_obs(next_obs)
+            (
+                next_obs_ids,
+                observation_token_lengths,
+                retained_observation_token_lengths,
+                observation_token_excess,
+            ) = self._process_next_obs(next_obs, return_token_stats=True)
+            for trajectory_index, successful_search in enumerate(is_search):
+                if successful_search:
+                    token_length = int(observation_token_lengths[trajectory_index].item())
+                    retained_token_length = int(retained_observation_token_lengths[trajectory_index].item())
+                    retrieval_observation_token_lengths[trajectory_index].append(token_length)
+                    retained_retrieval_observation_token_lengths[trajectory_index].append(retained_token_length)
+                    retrieval_observation_token_excess[trajectory_index].append(
+                        int(observation_token_excess[trajectory_index].item())
+                    )
+                    if retained_token_length < token_length:
+                        retrieval_observation_truncation_stats[trajectory_index] += 1
             
             # Update states
             rollings = self._update_rolling_state(
@@ -318,6 +355,10 @@ class LLMGenerationManager:
         meta_info['valid_action_stats'] = valid_action_stats.tolist()
         meta_info['valid_search_stats'] = valid_search_stats.tolist()
         meta_info['retrieval_success_stats'] = retrieval_success_stats.tolist()
+        meta_info['retrieval_observation_token_lengths'] = retrieval_observation_token_lengths
+        meta_info['retained_retrieval_observation_token_lengths'] = retained_retrieval_observation_token_lengths
+        meta_info['retrieval_observation_token_excess'] = retrieval_observation_token_excess
+        meta_info['retrieval_observation_truncation_stats'] = retrieval_observation_truncation_stats.tolist()
         
         print("ACTIVE_TRAJ_NUM:", active_num_list)
         
