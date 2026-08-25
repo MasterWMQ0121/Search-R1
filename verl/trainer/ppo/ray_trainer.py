@@ -225,6 +225,8 @@ def compute_data_metrics(batch, use_critic=True):
         # reward
         'critic/rewards/mean':
             torch.mean(sequence_reward).detach().item(),
+        'critic/rewards/std':
+            torch.std(sequence_reward, unbiased=False).detach().item(),
         'critic/rewards/max':
             torch.max(sequence_reward).detach().item(),
         'critic/rewards/min':
@@ -283,7 +285,21 @@ def compute_data_metrics(batch, use_critic=True):
         metrics['env/number_of_valid_action'] = float(np.array(batch.meta_info['valid_action_stats'], dtype=np.int16).mean())
         metrics['env/ratio_of_valid_action'] = float((np.array(batch.meta_info['valid_action_stats'], dtype=np.int16) / np.array(batch.meta_info['turns_stats'], dtype=np.int16)).mean())
     if 'valid_search_stats' in batch.meta_info:
-        metrics['env/number_of_valid_search'] = float(np.array(batch.meta_info['valid_search_stats'], dtype=np.int16).mean())
+        valid_search_stats = np.array(batch.meta_info['valid_search_stats'], dtype=np.int16)
+        metrics['env/number_of_valid_search'] = float(valid_search_stats.mean())
+        if 'turns_stats' in batch.meta_info:
+            turns_stats = np.array(batch.meta_info['turns_stats'], dtype=np.int16)
+            valid_search_ratio = np.divide(
+                valid_search_stats,
+                turns_stats,
+                out=np.zeros(valid_search_stats.shape, dtype=np.float64),
+                where=turns_stats != 0,
+            )
+            metrics['env/ratio_of_valid_search'] = float(valid_search_ratio.mean())
+    if 'retrieval_success_stats' in batch.meta_info:
+        retrieval_success_stats = np.array(batch.meta_info['retrieval_success_stats'], dtype=np.int16)
+        metrics['env/number_of_successful_retrievals'] = float(retrieval_success_stats.mean())
+        metrics['env/trajectories_with_retrieval'] = float((retrieval_success_stats > 0).mean())
 
 
     return metrics
