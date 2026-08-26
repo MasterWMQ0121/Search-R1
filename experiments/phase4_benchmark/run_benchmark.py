@@ -703,7 +703,8 @@ def _decode_search_trajectory(tokenizer, output):
 def evaluate_search_agent(example, tokenizer, generator, mode, model_path, search_url,
                           topk=3, max_turns=2, max_start_length=768,
                           max_response_length=128, max_obs_length=256,
-                          max_prompt_length=1408, run_config=None):
+                          max_prompt_length=1408, run_config=None,
+                          configure_manager=None):
     import torch
     from search_r1.llm_agent.generation import GenerationConfig, LLMGenerationManager
     from verl import DataProto
@@ -761,6 +762,8 @@ def evaluate_search_agent(example, tokenizer, generator, mode, model_path, searc
             retrieval_telemetry["latency_s"] += time.perf_counter() - retrieval_started
 
     manager._batch_search = MethodType(timed_batch_search, manager)
+    if configure_manager is not None:
+        configure_manager(manager)
     try:
         output = manager.run_llm_loop(gen_batch, input_ids.clone())
     except Exception as error:
@@ -828,22 +831,24 @@ def evaluate_search_agent(example, tokenizer, generator, mode, model_path, searc
 def evaluate_base_search(example, tokenizer, generator, model_path, search_url,
                          topk=3, max_turns=2, max_start_length=768,
                          max_response_length=128, max_obs_length=256,
-                         max_prompt_length=1408, run_config=None):
+                         max_prompt_length=1408, run_config=None,
+                         configure_manager=None):
     return evaluate_search_agent(
         example, tokenizer, generator, "base_search", model_path, search_url,
         topk, max_turns, max_start_length, max_response_length, max_obs_length,
-        max_prompt_length, run_config,
+        max_prompt_length, run_config, configure_manager,
     )
 
 
 def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,
                        topk=3, max_turns=2, max_start_length=768,
                        max_response_length=128, max_obs_length=256,
-                       max_prompt_length=1408, run_config=None):
+                       max_prompt_length=1408, run_config=None,
+                       configure_manager=None):
     return evaluate_search_agent(
         example, tokenizer, generator, "search_rl", model_path, search_url,
         topk, max_turns, max_start_length, max_response_length, max_obs_length,
-        max_prompt_length, run_config,
+        max_prompt_length, run_config, configure_manager,
     )
 
 

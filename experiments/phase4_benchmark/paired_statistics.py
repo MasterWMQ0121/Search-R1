@@ -57,23 +57,27 @@ def _artifact_binding(record, mode, uid):
     return eval_sha256, manifest_sha256
 
 
-def join_paired_results(result_sets):
-    """Strictly join four result sets by UID and validate paired identity fields."""
+def join_result_sets(result_sets, modes):
+    """Strictly join named result sets by UID and validate paired identity fields."""
 
-    if set(result_sets) != set(PAIRED_MODES):
+    modes = tuple(modes)
+    if len(modes) < 2 or len(modes) != len(set(modes)):
+        raise ValueError("paired analysis modes must be at least two unique names")
+    if set(result_sets) != set(modes):
         raise ValueError(
             "paired analysis requires exactly these modes: "
-            f"{PAIRED_MODES}"
+            f"{modes}"
         )
     mapped = {
         mode: _record_map(result_sets[mode], mode)
-        for mode in PAIRED_MODES
+        for mode in modes
     }
     uid_sets = {mode: set(records) for mode, records in mapped.items()}
-    baseline_uids = uid_sets["direct"]
+    baseline_mode = modes[0]
+    baseline_uids = uid_sets[baseline_mode]
     if not baseline_uids:
         raise ValueError("paired analysis requires at least one UID")
-    for mode in PAIRED_MODES[1:]:
+    for mode in modes[1:]:
         if uid_sets[mode] != baseline_uids:
             missing = sorted(baseline_uids - uid_sets[mode])
             unexpected = sorted(uid_sets[mode] - baseline_uids)
@@ -85,8 +89,8 @@ def join_paired_results(result_sets):
     joined = []
     bindings = set()
     for uid in sorted(baseline_uids):
-        records = {mode: mapped[mode][uid] for mode in PAIRED_MODES}
-        baseline = records["direct"]
+        records = {mode: mapped[mode][uid] for mode in modes}
+        baseline = records[baseline_mode]
         baseline_identity = (
             baseline.get("question"),
             baseline.get("ground_truth"),
@@ -130,6 +134,12 @@ def join_paired_results(result_sets):
             f"{sorted(bindings)}"
         )
     return joined
+
+
+def join_paired_results(result_sets):
+    """Strictly join the four Phase-4 modes without changing its public API."""
+
+    return join_result_sets(result_sets, PAIRED_MODES)
 
 
 def _sha256_file(path):
@@ -199,8 +209,11 @@ def _slice_rows(joined, source):
     return rows
 
 
-def _validate_comparison_modes(mode_a, mode_b):
-    if mode_a not in PAIRED_MODES or mode_b not in PAIRED_MODES:
+def _validate_comparison_modes(joined, mode_a, mode_b):
+    if not joined or not isinstance(joined[0].get("outcomes"), dict):
+        raise ValueError("paired comparison requires joined outcome rows")
+    available_modes = set(joined[0]["outcomes"])
+    if mode_a not in available_modes or mode_b not in available_modes:
         raise ValueError(f"unsupported paired comparison: {mode_a!r}, {mode_b!r}")
     if mode_a == mode_b:
         raise ValueError("paired comparison modes must differ")
@@ -233,7 +246,7 @@ def paired_bootstrap(
 ):
     """Return a paired percentile interval for EM(A) - EM(B), in points."""
 
-    _validate_comparison_modes(mode_a, mode_b)
+    _validate_comparison_modes(joined, mode_a, mode_b)
     if isinstance(samples, bool) or not isinstance(samples, int) or samples <= 0:
         raise ValueError("bootstrap samples must be a positive integer")
     if not 0.0 < confidence_level < 1.0:
@@ -289,7 +302,7 @@ def paired_bootstrap(
 def exact_mcnemar(joined, mode_a, mode_b, *, source=None):
     """Compute the exact two-sided McNemar test without SciPy."""
 
-    _validate_comparison_modes(mode_a, mode_b)
+    _validate_comparison_modes(joined, mode_a, mode_b)
     rows = _slice_rows(joined, source)
     both_correct = 0
     a_only_correct = 0
