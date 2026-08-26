@@ -1,13 +1,15 @@
-# Phase 4: held-out Direct vs Static RAG vs Search-RL benchmark
+# Phase 4: four-mode held-out Search-RL benchmark
 
 Phase 4 is the first product-quality comparison in this project. It evaluates
-the same held-out questions with three inference structures:
+the same held-out questions with four inference structures:
 
 - **Direct:** base Qwen2.5-3B-Instruct, no retrieval, one generation.
 - **Static RAG:** the same base model, exactly one E5/Wiki-18 top-3 retrieval,
   then one generation from a fixed context prompt.
+- **Base Search:** the same untrained base model in the existing dynamic
+  Search-R1 agent loop, with at most two search-enabled turns.
 - **Search-RL:** the Phase-3 actor checkpoint and the existing Search-R1 agent
-  loop, with dynamic search actions and at most two search-enabled turns.
+  loop, with exactly the same dynamic search configuration as Base Search.
 
 The earlier phases have narrower meanings. Phase 1 proved small answer-leaky
 plumbing, Phase 2 proved a real-data GRPO reward signal, and Phase 3 proved 20
@@ -15,7 +17,11 @@ sustained real-data optimizer updates and exported an actor checkpoint. None of
 those phases measured a held-out quality advantage. Phase 4 may support a claim
 such as “Search-RL improved EM by X.X percentage points versus Static RAG,” but
 only after `summary.json` computes X.X from a completed A800 run. This README
-does not pre-fill or predict that number.
+does not pre-fill or predict that number. Base Search vs Direct describes the
+agent/tool-use architecture delta; Search-RL vs Base Search is the primary
+20-step GRPO post-training comparison with agent architecture held fixed;
+Static RAG vs Direct describes single-stage retrieval; and Search-RL vs Static
+RAG combines the dynamic-agent and post-training differences.
 
 ## Fixed primary benchmark
 
@@ -27,14 +33,14 @@ does not pre-fill or predict that number.
   utilization, greedy decoding, and 128 generated tokens per model call.
 - Retriever: the existing CPU E5-base-v2/Wiki-18 service at
   `http://127.0.0.1:8000/retrieve`, top-k 3.
-- Search-RL: `max_turns=2`, `max_start_length=768`,
+- Base Search and Search-RL: `max_turns=2`, `max_start_length=768`,
   `max_response_length=128`, `max_obs_length=256`, and
   `max_prompt_length=1408`.
 
-The Search-RL observation limit deliberately remains **256**. Phase-3 warnings
-such as `549 & 256` are evidence to measure, not permission to alter the trained
-configuration. The existing tokenizer call, warning, and literal 256-token
-prefix slice are unchanged.
+The Search-Agent observation limit deliberately remains **256**. Phase-3
+warnings such as `549 & 256` are evidence to measure, not permission to alter
+the trained configuration. The existing tokenizer call, warning, and literal
+256-token prefix slice are unchanged.
 
 Static RAG has an explicit **512-token retrieved-context budget**. The top-3
 passages are concatenated in retriever rank order using the same `Doc N(Title:
@@ -110,8 +116,10 @@ The Static-RAG prompt is:
 Answer the given question with some potentially useful context. You should analyze the question carefully, evaluate the given context (which may or may not be useful), and then generate an accurate and well-reasoned response. You should first have a reasoning process in mind and then provides the answer. Show your reasoning in <think> </think> tags and return the final answer in <answer> </answer> tags, for example <answer> Beijing </answer>. Question: {question} Context: {top-3 context, capped at 512 tokenizer tokens}
 ```
 
-Search-RL receives the original Search-R1 prompt stored in the parquet and runs
-`LLMGenerationManager` with unchanged generation semantics. A thin adapter
+Base Search and Search-RL receive the same original Search-R1 prompt stored in
+the parquet and run the same `LLMGenerationManager` evaluator with unchanged
+generation semantics. Their only intentional differences are the mode name and
+model checkpoint path. A thin adapter
 exposes public vLLM through the manager's existing rollout interface; it does
 not reimplement action parsing, invalid-action feedback, retrieved-document
 formatting, state masks, or observation truncation. The only shared-code change
@@ -119,10 +127,10 @@ is additive token-length/truncation metadata around the existing slice.
 
 Latency must be interpreted structurally. Model construction is excluded from
 example latency, but Direct performs one generation, Static RAG performs one
-HTTP retrieval plus one generation, and Search-RL can perform up to three model
-calls (two search-enabled turns plus the final generation) and zero to two
-completed retrievals. Their end-to-end latency numbers are therefore useful
-product measurements, not equivalent single-call kernel benchmarks.
+HTTP retrieval plus one generation, and each Search Agent can perform up to
+three model calls (two search-enabled turns plus the final generation) and zero
+to two completed retrievals. Their end-to-end latency numbers are therefore
+useful product measurements, not equivalent single-call kernel benchmarks.
 
 ## Retriever and A800 run
 
@@ -167,23 +175,28 @@ repeating completed rows:
 ```bash
 bash experiments/phase4_benchmark/run_benchmark.sh direct
 bash experiments/phase4_benchmark/run_benchmark.sh static_rag
+bash experiments/phase4_benchmark/run_benchmark.sh base_search
 bash experiments/phase4_benchmark/run_benchmark.sh search_rl
 bash experiments/phase4_benchmark/run_benchmark.sh summarize
 ```
 
 Set `PHASE4_OVERWRITE=true` only when intentionally replacing a mode artifact.
+For the current A800 continuation, preserve the three completed JSONL files and
+run only `base_search`; `summarize` then consumes all four files.
 
 ## Artifacts and metrics
 
 The result directory contains `direct.jsonl`, `static_rag.jsonl`,
-`search_rl.jsonl`, and `summary.json`. Every JSONL row includes UID, source,
-question, targets, model/mode, extracted prediction, binary exact match,
-trajectory, generation latency, and end-to-end latency. Static RAG also stores
-one retrieval latency, document identifiers/titles/scores, context budget, and
-raw/retained context token counts.
+`base_search.jsonl`, `search_rl.jsonl`, `summary.json`,
+`paired_statistics.json`, and `paired_statistics.md`. Every JSONL row includes
+UID, source, question, targets, model/mode, extracted prediction, binary exact
+match, trajectory, generation latency, and end-to-end latency. Static RAG also
+stores one retrieval latency, document identifiers/titles/scores, context
+budget, and raw/retained context token counts.
 
-Search-RL rows additionally store action/search/retrieval counts, finish state,
-retrieval failure count, generation/retrieval timing, and:
+Base Search and Search-RL rows additionally store action/search/retrieval
+counts, finish state, retrieval failure count, generation/retrieval timing,
+and:
 
 - `observation_truncation_count`;
 - whether the trajectory had any truncated observation;
@@ -196,25 +209,71 @@ on the final retrieval-disabled generation counts as a valid search action but
 not as a successful retrieval. The two fields are intentionally reported
 separately.
 
-Search-RL `generation_latency_s` and `retrieval_latency_s` are cumulative
+Search-Agent `generation_latency_s` and `retrieval_latency_s` are cumulative
 per-trajectory totals across its dynamic calls. Their summary p50/p95 values
 are distributions of those trajectory totals, not distributions of individual
 model or HTTP calls.
 
 The summary reports overall/NQ/HotpotQA EM and correct/total, end-to-end mean,
 p50 and p95 latency, Static-RAG retrieval latency, the requested Search-Agent
-behavior metrics, and observation/context truncation aggregates. Percentage-
-point comparisons are calculated only from the three measured files.
+behavior metrics, and observation/context truncation aggregates. It reports all
+five requested EM percentage-point differences and Search-RL-minus-Base-Search
+behavior/latency deltas; all values are computed from result files, never
+hard-coded.
 
 Failure analysis reports NQ and HotpotQA incorrect counts that co-occur with
-Static-RAG context truncation or Search-RL observation truncation. Co-occurrence
-makes truncation a plausible contributor worth investigating; it does **not**
-establish causality, and the generated assessment says so explicitly.
+Static-RAG context truncation or either Search Agent's observation truncation.
+Co-occurrence makes truncation a plausible contributor worth investigating; it
+does **not** establish causality, and the generated assessment says so
+explicitly.
 
 Every row also carries a hash-bound run configuration covering the evaluation
 parquet/manifest, model, retriever URL/top-k, decoding, token limits, backend,
 and prompt contract. Resume rejects stale or mixed configurations. A nonzero
-Search-RL retrieval-failure count leaves the rows visible in EM and failure
-totals, excludes those incomplete trajectories from agent-behavior ratios, and
-marks `benchmark_status.quality_claim_ready=false`; rerun before making a
-quality claim.
+retrieval-failure count in either Agent mode leaves rows visible in EM and
+failure totals, excludes incomplete trajectories from that mode's
+agent-behavior ratios, and marks both quality and inference readiness false;
+rerun before making a claim.
+
+## Paired statistical analysis
+
+Four-mode summarization strictly joins records by UID and rejects duplicates,
+missing or nonidentical UID sets, mismatched questions/targets/sources, mixed
+run configurations, and result files not bound to the same audited evaluation
+parquet and manifest hashes. It also enforces that Direct, Static RAG, and Base
+Search use one base checkpoint, and that Base Search and Search-RL agent
+configurations differ only by `mode` and `model_path`.
+
+The pre-specified primary comparison is Search-RL minus Base Search. Secondary
+comparisons are Base Search vs Direct, Static RAG vs Direct, Search-RL vs Static
+RAG, Search-RL vs Direct, and Base Search vs Static RAG; their p-values are
+exploratory, not independently confirmatory.
+
+For each comparison, `paired_statistics.json` reports overall, NQ, and HotpotQA
+EM differences in percentage points. The 95% percentile interval uses 10,000
+paired resamples with seed 42. Overall resampling is source-stratified: NQ and
+HotpotQA UID pairs are sampled with replacement within source while retaining
+the 32/32 mixture. Source-specific intervals resample pairs only within that
+source. Modes are never bootstrapped independently.
+
+The exact two-sided McNemar result reports both-correct, A-only-correct,
+B-only-correct, both-incorrect, discordant count, and the exact binomial
+p-value. With `n` discordant pairs it computes twice the probability at or
+below the smaller discordant cell under `Binomial(n, 0.5)`, caps at 1, and uses
+1 when `n=0`; SciPy is not required.
+
+Interpretation is generated from fixed rules. Even when both the primary
+interval excludes zero and McNemar gives `p < 0.05`, the statement is limited
+to this deterministic held-out benchmark. It always notes `n=64`, 32 NQ / 32
+HotpotQA, limited sample size, and exact match's sparse binary signal. It never
+claims proof, guaranteed improvement, or production-wide significance. Claims
+are ready only with exactly 64 valid rows per mode, identical UIDs and artifact
+hashes, no Agent retrieval failures, and no evaluation errors.
+
+The standalone analysis is available after all four JSONL files exist:
+
+```bash
+python3 -m experiments.phase4_benchmark.paired_statistics \
+  --results-dir /workspace/Search-R1/phase4_benchmark_results \
+  --eval-manifest /workspace/searchr1-assets/datasets/phase4_benchmark/manifest.json
+```

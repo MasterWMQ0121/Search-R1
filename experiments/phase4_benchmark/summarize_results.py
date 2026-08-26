@@ -6,8 +6,15 @@ import json
 import statistics
 from pathlib import Path
 
+from experiments.phase4_benchmark.paired_statistics import (
+    analyze_paired_results,
+    join_paired_results,
+    render_markdown,
+    validate_joined_against_manifest,
+)
 from experiments.phase4_benchmark.prepare_eval_data import sha256_file
 from experiments.phase4_benchmark.run_benchmark import (
+    AGENT_MODES,
     MODES,
     read_result_file,
     validate_result_record,
@@ -125,7 +132,9 @@ def search_agent_metrics(records):
         retained = record["retained_observation_lengths_after_truncation"]
         excess = record["observation_excess_tokens"]
         if not (len(raw) == len(retained) == len(excess)):
-            raise ValueError(f"Search-RL observation metrics are misaligned for {record['uid']}")
+            raise ValueError(
+                f"Search Agent observation metrics are misaligned for {record['uid']}"
+            )
         raw_lengths.extend(raw)
         retained_lengths.extend(retained)
         excess_tokens.extend(excess)
@@ -188,9 +197,54 @@ def summarize_mode(records, mode):
     }
     if mode == "static_rag":
         summary["static_rag"] = static_rag_metrics(records)
-    if mode == "search_rl":
+    if mode in AGENT_MODES:
         summary["agent"] = search_agent_metrics(records)
     return summary
+
+
+def _difference(left, right):
+    if left is None or right is None:
+        return None
+    return left - right
+
+
+def agent_behavior_deltas(summaries):
+    base = summaries["base_search"]
+    trained = summaries["search_rl"]
+    base_agent = base["agent"]
+    trained_agent = trained["agent"]
+    scalar_metrics = (
+        "finish_ratio",
+        "valid_action_ratio",
+        "valid_search_ratio",
+        "mean_valid_searches_per_trajectory",
+        "mean_successful_retrievals_per_trajectory",
+        "fraction_trajectories_with_retrieval",
+        "mean_number_of_actions",
+        "fraction_trajectories_with_observation_truncation",
+    )
+    deltas = {
+        f"{metric}_delta": _difference(trained_agent[metric], base_agent[metric])
+        for metric in scalar_metrics
+    }
+    deltas.update({
+        "retrieval_latency_mean_s_delta": _difference(
+            trained_agent["retrieval_latency"]["mean_s"],
+            base_agent["retrieval_latency"]["mean_s"],
+        ),
+        "generation_latency_mean_s_delta": _difference(
+            trained_agent["generation_latency"]["mean_s"],
+            base_agent["generation_latency"]["mean_s"],
+        ),
+        "end_to_end_latency_mean_s_delta": _difference(
+            trained["latency"]["mean_s"], base["latency"]["mean_s"]
+        ),
+    })
+    return {
+        "orientation": "search_rl_minus_base_search",
+        "interpretation": "Descriptive behavior deltas; they are not causal proof by themselves.",
+        **deltas,
+    }
 
 
 def _truncation_failure_analysis(records, truncation_predicate, label):
@@ -260,7 +314,7 @@ def summarize_all(result_sets):
         )
         for record in result_sets["direct"]
     }
-    for mode in ("static_rag", "search_rl"):
+    for mode in ("static_rag", "base_search", "search_rl"):
         examples = {
             record["uid"]: (
                 record["data_source"], record["question"], tuple(record["ground_truth"])
@@ -278,11 +332,16 @@ def summarize_all(result_sets):
     }
     direct_em = summaries["direct"]["overall_em"]
     static_em = summaries["static_rag"]["overall_em"]
+    base_search_em = summaries["base_search"]["overall_em"]
     search_em = summaries["search_rl"]["overall_em"]
     summaries["comparisons"] = {
+        "base_search_vs_direct_em_pp": (base_search_em - direct_em) * 100.0,
+        "base_search_vs_static_rag_em_pp": (base_search_em - static_em) * 100.0,
+        "search_rl_vs_base_search_em_pp": (search_em - base_search_em) * 100.0,
         "search_rl_vs_direct_em_pp": (search_em - direct_em) * 100.0,
         "search_rl_vs_static_rag_em_pp": (search_em - static_em) * 100.0,
     }
+    summaries["agent_behavior_deltas"] = agent_behavior_deltas(summaries)
     summaries["failure_analysis"] = {
         "static_rag_context_truncation": _truncation_failure_analysis(
             result_sets["static_rag"],
@@ -291,6 +350,11 @@ def summarize_all(result_sets):
                 > record["retrieved_context_tokens_retained"]
             ),
             "Static-RAG retrieved-context truncation",
+        ),
+        "base_search_observation_truncation": _truncation_failure_analysis(
+            result_sets["base_search"],
+            lambda record: bool(record["trajectory_had_observation_truncation"]),
+            "Base Search retrieved-observation truncation",
         ),
         "search_rl_observation_truncation": _truncation_failure_analysis(
             result_sets["search_rl"],
@@ -325,6 +389,26 @@ def validate_results_against_manifest(result_sets, manifest, manifest_sha256):
         if run_config.get("eval_manifest_sha256") != manifest_sha256:
             raise ValueError(f"{mode} run_config is bound to a different eval manifest")
         run_configs[mode] = run_config
+    base_model_paths = {
+        run_configs[mode]["model_path"]
+        for mode in ("direct", "static_rag", "base_search")
+    }
+    if len(base_model_paths) != 1:
+        raise ValueError(
+            "Direct, Static-RAG, and Base Search must use the same base model checkpoint"
+        )
+    base_agent_config = {
+        key: value for key, value in run_configs["base_search"].items()
+        if key not in {"mode", "model_path"}
+    }
+    trained_agent_config = {
+        key: value for key, value in run_configs["search_rl"].items()
+        if key not in {"mode", "model_path"}
+    }
+    if base_agent_config != trained_agent_config:
+        raise ValueError(
+            "Base Search and Search-RL run configurations must differ only by mode and model_path"
+        )
     return run_configs
 
 
@@ -359,14 +443,28 @@ def main():
         result_sets, manifest, manifest_sha
     )
     summary = summarize_all(result_sets)
+    joined = join_paired_results(result_sets)
+    paired_report = analyze_paired_results(result_sets)
+    paired_report["configuration"]["eval_manifest_audit"] = (
+        validate_joined_against_manifest(joined, manifest_path)
+    )
+    paired_json_path = results_dir / "paired_statistics.json"
+    paired_markdown_path = results_dir / "paired_statistics.md"
+    paired_json_path.write_text(
+        json.dumps(paired_report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    paired_markdown_path.write_text(
+        render_markdown(paired_report), encoding="utf-8"
+    )
     summary["benchmark"] = {
         "eval_manifest_path": str(manifest_path),
         "eval_manifest_sha256": manifest_sha,
         "eval_parquet_sha256": manifest.get("output", {}).get("sha256"),
         "seed": 42,
         "question_count": 64,
-        "nq_count": 32,
-        "hotpotqa_count": 32,
+        "nq_count": paired_report["readiness"]["source_counts"]["nq"],
+        "hotpotqa_count": paired_report["readiness"]["source_counts"]["hotpotqa"],
         "greedy": True,
         "max_response_length": 128,
         "models": {mode: run_configs[mode]["model_path"] for mode in MODES},
@@ -379,6 +477,13 @@ def main():
             "retrieved_context_token_budget": 512,
             "retrieval_stages_per_example": 1,
         },
+        "base_search": {
+            "retriever_topk": 3,
+            "retriever_url": run_configs["base_search"]["retriever_url"],
+            "max_turns": 2,
+            "max_obs_length": 256,
+            "max_prompt_length": 1408,
+        },
         "search_rl": {
             "retriever_topk": 3,
             "retriever_url": run_configs["search_rl"]["retriever_url"],
@@ -387,21 +492,56 @@ def main():
             "max_prompt_length": 1408,
         },
     }
-    retrieval_failure_count = summary["search_rl"]["agent"][
-        "search_retrieval_failure_count"
-    ]
+    retrieval_failure_counts = {
+        mode: summary[mode]["agent"]["search_retrieval_failure_count"]
+        for mode in AGENT_MODES
+    }
+    evaluation_error_counts = {
+        mode: sum(bool(record.get("evaluation_error")) for record in records)
+        for mode, records in result_sets.items()
+    }
+    claim_ready = (
+        not any(retrieval_failure_counts.values())
+        and not any(evaluation_error_counts.values())
+        and paired_report["inference_claim_ready"]
+    )
     summary["benchmark_status"] = {
-        "quality_claim_ready": retrieval_failure_count == 0,
-        "search_retrieval_failure_count": retrieval_failure_count,
+        "quality_claim_ready": claim_ready,
+        "inference_claim_ready": claim_ready,
+        "search_retrieval_failure_count": retrieval_failure_counts["search_rl"],
+        "agent_retrieval_failure_counts": retrieval_failure_counts,
+        "evaluation_error_counts": evaluation_error_counts,
         "warning": (
             None
-            if retrieval_failure_count == 0
-            else "Search-RL retrieval failures contaminated quality results; rerun before making a quality claim."
+            if claim_ready
+            else (
+                paired_report["readiness"]["warning"]
+                or "Retrieval failures or evaluation errors are present; descriptive rows remain auditable, but quality and inference claims are not ready."
+            )
         ),
     }
     summary["artifacts"] = {
         mode: {"path": str(path), "sha256": sha256_file(path)}
         for mode, path in result_paths.items()
+    }
+    summary["artifacts"].update({
+        "paired_statistics_json": {
+            "path": str(paired_json_path),
+            "sha256": sha256_file(paired_json_path),
+        },
+        "paired_statistics_markdown": {
+            "path": str(paired_markdown_path),
+            "sha256": sha256_file(paired_markdown_path),
+        },
+    })
+    summary["paired_statistics"] = {
+        "primary_comparison": paired_report["primary"]["comparison"],
+        "primary_overall": paired_report["primary"]["overall"],
+        "quality_claim_ready": paired_report["quality_claim_ready"],
+        "inference_claim_ready": paired_report["inference_claim_ready"],
+        "interpretation": paired_report["primary"]["interpretation"],
+        "json_artifact": summary["artifacts"]["paired_statistics_json"],
+        "markdown_artifact": summary["artifacts"]["paired_statistics_markdown"],
     }
     output_path = (
         Path(args.output).expanduser().resolve()

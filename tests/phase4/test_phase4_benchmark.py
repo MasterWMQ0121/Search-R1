@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import warnings
 
 import numpy as np
@@ -148,7 +149,7 @@ def _record(mode, uid, source, exact_match, latency, **updates):
             "retrieved_context_tokens_before_truncation": 400,
             "retrieved_context_tokens_retained": 400,
         })
-    if mode == "search_rl":
+    if mode in benchmark.AGENT_MODES:
         record.update({
             "number_of_actions": 1,
             "number_of_valid_actions": 1,
@@ -184,6 +185,176 @@ def _search_output(response_ids, valid_length=None):
             [torch.ones_like(prompts), response_mask], dim=1
         ),
     })
+
+
+def test_base_search_is_supported_and_existing_fingerprints_are_unchanged():
+    assert benchmark.MODES == (
+        "direct",
+        "static_rag",
+        "base_search",
+        "search_rl",
+    )
+    assert benchmark.AGENT_MODES == ("base_search", "search_rl")
+    assert benchmark.MODE_RESULT_FIELDS["base_search"] == (
+        benchmark.MODE_RESULT_FIELDS["search_rl"]
+    )
+
+    expected_existing_fingerprints = {
+        "direct": "3e8ada978d4ed4cced87b4e7b1f693187bb9ea533592cdd14ad02be73bf44089",
+        "static_rag": "50b659cc974342c340bc5eff8c77b1c3b91b9851465f42eb44353c5b744fd587",
+        "search_rl": "6a85575a1a0b9eabb04f7a455d9d9aeb15a080926107d838f50c5a35e9b6228e",
+    }
+    assert {
+        mode: benchmark.run_config_fingerprint(
+            benchmark._default_test_run_config(mode, "model")
+        )
+        for mode in expected_existing_fingerprints
+    } == expected_existing_fingerprints
+
+
+def test_base_and_trained_search_configs_differ_only_by_mode_and_model():
+    base = benchmark._default_test_run_config("base_search", "base-model")
+    trained = benchmark._default_test_run_config("search_rl", "trained-model")
+
+    assert base["model_path"] == "base-model"
+    assert trained["model_path"] == "trained-model"
+    assert base["mode"] == "base_search"
+    assert trained["mode"] == "search_rl"
+    for config in (base, trained):
+        assert config["greedy"] is True
+        assert config["seed"] == 42
+        assert config["retriever_topk"] == 3
+        assert config["max_turns"] == 2
+        assert config["max_start_length"] == 768
+        assert config["max_response_length"] == 128
+        assert config["max_obs_length"] == 256
+        assert config["max_prompt_length"] == 1408
+
+    assert {
+        key: value for key, value in base.items()
+        if key not in {"mode", "model_path"}
+    } == {
+        key: value for key, value in trained.items()
+        if key not in {"mode", "model_path"}
+    }
+    assert benchmark.run_config_fingerprint(base) != (
+        benchmark.run_config_fingerprint(trained)
+    )
+
+
+def test_base_and_trained_search_wrappers_share_one_agent_evaluator(monkeypatch):
+    calls = []
+
+    def fake_evaluate_search_agent(*args):
+        calls.append(args)
+        return {"mode": args[3], "model_path": args[4]}
+
+    monkeypatch.setattr(
+        benchmark, "evaluate_search_agent", fake_evaluate_search_agent
+    )
+    example = _example()
+    tokenizer = FakeTokenizer()
+    generator = FakeGenerator([])
+
+    base = benchmark.evaluate_base_search(
+        example, tokenizer, generator, "base-model", "http://retriever/retrieve"
+    )
+    trained = benchmark.evaluate_search_rl(
+        example, tokenizer, generator, "trained-model", "http://retriever/retrieve"
+    )
+
+    assert base == {"mode": "base_search", "model_path": "base-model"}
+    assert trained == {"mode": "search_rl", "model_path": "trained-model"}
+    assert calls[0][:3] == calls[1][:3]
+    assert calls[0][5:] == calls[1][5:]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_model", "expected_evaluator"),
+    [
+        ("direct", "base-model", "direct"),
+        ("static_rag", "base-model", "static_rag"),
+        ("base_search", "base-model", "base_search"),
+        ("search_rl", "trained-model", "search_rl"),
+    ],
+)
+def test_main_selects_the_expected_checkpoint_and_evaluator(
+    tmp_path, monkeypatch, mode, expected_model, expected_evaluator
+):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    args = SimpleNamespace(
+        mode=mode,
+        eval_data=str(tmp_path / "eval.parquet"),
+        eval_manifest=str(manifest_path),
+        output_dir=str(tmp_path / "results"),
+        base_model="base-model",
+        search_model="trained-model",
+        retriever_url="http://retriever/retrieve",
+        retriever_topk=3,
+        static_context_token_budget=512,
+        max_start_length=768,
+        max_response_length=128,
+        max_obs_length=256,
+        max_turns=2,
+        max_prompt_length=1408,
+        gpu_memory_utilization=0.20,
+        seed=42,
+        overwrite=False,
+    )
+    example = _example()
+    manifest = {"output": {"sha256": "test-eval"}}
+    observed = {"evaluators": []}
+
+    class StubVLLMGenerator:
+        def __init__(self, model_path, **_kwargs):
+            observed["initialized_model"] = model_path
+            self.tokenizer = FakeTokenizer()
+
+    def evaluator(name, model_index):
+        def evaluate(*call_args):
+            observed["evaluators"].append(name)
+            observed["evaluator_model"] = call_args[model_index]
+            observed["run_config"] = call_args[-1]
+            return {"mode": name}
+
+        return evaluate
+
+    def fake_run_with_resume(
+        examples, _result_path, selected_mode, evaluate_one, **_kwargs
+    ):
+        assert selected_mode == mode
+        assert examples == [example]
+        evaluate_one(example)
+        return []
+
+    monkeypatch.setattr(benchmark, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        benchmark, "load_eval_examples", lambda *_args: ([example], manifest)
+    )
+    monkeypatch.setattr(benchmark, "VLLMGenerator", StubVLLMGenerator)
+    monkeypatch.setattr(
+        benchmark, "ExistingRetrieverClient", lambda *_args: object()
+    )
+    monkeypatch.setattr(benchmark, "evaluate_direct", evaluator("direct", 3))
+    monkeypatch.setattr(
+        benchmark, "evaluate_static_rag", evaluator("static_rag", 4)
+    )
+    monkeypatch.setattr(
+        benchmark, "evaluate_base_search", evaluator("base_search", 3)
+    )
+    monkeypatch.setattr(
+        benchmark, "evaluate_search_rl", evaluator("search_rl", 3)
+    )
+    monkeypatch.setattr(benchmark, "run_with_resume", fake_run_with_resume)
+
+    benchmark.main()
+
+    assert observed["initialized_model"] == expected_model
+    assert observed["evaluator_model"] == expected_model
+    assert observed["evaluators"] == [expected_evaluator]
+    assert observed["run_config"]["mode"] == mode
+    assert observed["run_config"]["model_path"] == expected_model
 
 
 def test_search_trajectory_decode_preserves_long_token_ids_and_order():
@@ -362,7 +533,16 @@ def test_static_rag_uses_exactly_one_retrieval_and_shared_em_semantics():
     benchmark.validate_result_record(result, "static_rag")
 
 
-def test_search_rl_mode_reuses_existing_agent_loop_and_reports_metrics(monkeypatch):
+@pytest.mark.parametrize(
+    ("mode", "evaluator", "model_path"),
+    [
+        ("base_search", benchmark.evaluate_base_search, "base-model"),
+        ("search_rl", benchmark.evaluate_search_rl, "trained-model"),
+    ],
+)
+def test_search_modes_share_agent_loop_and_report_the_same_metrics(
+    monkeypatch, mode, evaluator, model_path
+):
     tokenizer = FakeTokenizer()
     generator = FakeGenerator([
         "<think>need evidence</think><search>capital of France</search>",
@@ -384,13 +564,15 @@ def test_search_rl_mode_reuses_existing_agent_loop_and_reports_metrics(monkeypat
     monkeypatch.setattr(
         agent_generation.LLMGenerationManager, "_batch_search", fake_batch_search
     )
-    result = benchmark.evaluate_search_rl(
-        _example(), tokenizer, generator, "trained-model",
+    result = evaluator(
+        _example(), tokenizer, generator, model_path,
         "http://retriever/retrieve",
     )
 
     assert len(generator.calls) == 2
     assert retrieval_calls == [["capital of France"]]
+    assert result["mode"] == mode
+    assert result["model_path"] == model_path
     assert result["prediction"] == "Paris"
     assert result["exact_match"] == 1
     assert result["number_of_actions"] == 2
@@ -400,7 +582,7 @@ def test_search_rl_mode_reuses_existing_agent_loop_and_reports_metrics(monkeypat
     assert result["finished"] is True
     assert result["search_retrieval_failure_count"] == 0
     assert len(result["retrieved_observation_lengths_before_truncation"]) == 1
-    benchmark.validate_result_record(result, "search_rl")
+    benchmark.validate_result_record(result, mode)
 
 
 def test_search_rl_full_flow_decodes_integer_valued_float_output(monkeypatch):
@@ -500,6 +682,27 @@ def test_latency_quality_search_metrics_and_percentage_point_comparisons():
         ),
         _record("static_rag", "hotpotqa:2", "hotpotqa", 1, 4.0),
     ]
+    base_search = [
+        _record(
+            "base_search", "nq:1", "nq", 1, 2.0,
+            number_of_actions=1,
+            number_of_valid_actions=1,
+            finished=True,
+            retrieval_latency_s=0.0,
+        ),
+        _record(
+            "base_search", "hotpotqa:2", "hotpotqa", 0, 4.0,
+            number_of_actions=2,
+            number_of_valid_actions=1,
+            number_of_valid_searches=1,
+            number_of_successful_retrievals=1,
+            finished=False,
+            retrieval_latency_s=0.25,
+            retrieved_observation_lengths_before_truncation=[200],
+            retained_observation_lengths_after_truncation=[200],
+            observation_excess_tokens=[0],
+        ),
+    ]
     search = [
         _record(
             "search_rl", "nq:1", "nq", 0, 3.0,
@@ -525,6 +728,7 @@ def test_latency_quality_search_metrics_and_percentage_point_comparisons():
     result = summary.summarize_all({
         "direct": direct,
         "static_rag": static,
+        "base_search": base_search,
         "search_rl": search,
     })
 
@@ -532,7 +736,11 @@ def test_latency_quality_search_metrics_and_percentage_point_comparisons():
     assert result["static_rag"]["overall_em"] == 0.5
     assert result["search_rl"]["nq_em"] == 0.0
     assert result["search_rl"]["hotpotqa_em"] == 1.0
+    assert result["base_search"]["overall_em"] == 0.5
     assert result["comparisons"] == {
+        "base_search_vs_direct_em_pp": 50.0,
+        "base_search_vs_static_rag_em_pp": 0.0,
+        "search_rl_vs_base_search_em_pp": 0.0,
         "search_rl_vs_direct_em_pp": 50.0,
         "search_rl_vs_static_rag_em_pp": 0.0,
     }
@@ -556,8 +764,22 @@ def test_latency_quality_search_metrics_and_percentage_point_comparisons():
     assert agent["retained_observation_tokens_after_truncation_mean"] == 256
     assert agent["excess_tokens_above_max_obs_length_mean"] == 44
     assert agent["excess_tokens_above_max_obs_length_max"] == 44
+    deltas = result["agent_behavior_deltas"]
+    assert deltas["orientation"] == "search_rl_minus_base_search"
+    assert deltas["finish_ratio_delta"] == 0.0
+    assert deltas["valid_action_ratio_delta"] == 0.25
+    assert deltas["valid_search_ratio_delta"] == 0.0
+    assert deltas["mean_valid_searches_per_trajectory_delta"] == 0.0
+    assert deltas["mean_successful_retrievals_per_trajectory_delta"] == 0.0
+    assert deltas["fraction_trajectories_with_retrieval_delta"] == 0.0
+    assert deltas["mean_number_of_actions_delta"] == 0.0
+    assert deltas["fraction_trajectories_with_observation_truncation_delta"] == 0.5
+    assert deltas["retrieval_latency_mean_s_delta"] == 0.125
+    assert deltas["generation_latency_mean_s_delta"] == 0.5
+    assert deltas["end_to_end_latency_mean_s_delta"] == 1.0
     failure = result["failure_analysis"]
     assert failure["static_rag_context_truncation"]["plausible_contributor"] is True
+    assert failure["base_search_observation_truncation"]["plausible_contributor"] is False
     assert failure["search_rl_observation_truncation"]["plausible_contributor"] is True
     assert "does not establish causality" in (
         failure["search_rl_observation_truncation"]["assessment"]
@@ -568,6 +790,7 @@ def test_summary_rejects_nonidentical_mode_uid_sets():
     result_sets = {
         "direct": [_record("direct", "nq:1", "nq", 0, 1.0)],
         "static_rag": [_record("static_rag", "nq:2", "nq", 0, 1.0)],
+        "base_search": [_record("base_search", "nq:1", "nq", 0, 1.0)],
         "search_rl": [_record("search_rl", "nq:1", "nq", 0, 1.0)],
     }
     with pytest.raises(ValueError, match="same UID set"):
@@ -578,6 +801,7 @@ def test_summary_rejects_results_not_bound_to_manifest_uids_and_hash():
     result_sets = {
         "direct": [_record("direct", "nq:1", "nq", 0, 1.0)],
         "static_rag": [_record("static_rag", "nq:1", "nq", 0, 1.0)],
+        "base_search": [_record("base_search", "nq:1", "nq", 0, 1.0)],
         "search_rl": [_record("search_rl", "nq:1", "nq", 0, 1.0)],
     }
     manifest = {
@@ -588,6 +812,119 @@ def test_summary_rejects_results_not_bound_to_manifest_uids_and_hash():
         summary.validate_results_against_manifest(
             result_sets, manifest, "test-manifest"
         )
+
+
+def test_summary_cli_writes_and_references_paired_statistics_artifacts(
+    tmp_path, monkeypatch
+):
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "seed": 42,
+        "selected_row_count": 64,
+        "non_overlap_audit": {"passed": True},
+        "output": {"sha256": "eval-sha"},
+    }), encoding="utf-8")
+    result_sets = {
+        mode: [
+            {
+                "mode": mode,
+                "uid": f"nq:{index}",
+                "run_fingerprint": f"{mode}-fingerprint",
+                "evaluation_error": None,
+            }
+            for index in range(64)
+        ]
+        for mode in benchmark.MODES
+    }
+    run_configs = {
+        mode: {
+            "model_path": (
+                "trained-model" if mode == "search_rl" else "base-model"
+            ),
+            "retriever_url": None if mode == "direct" else "retriever",
+        }
+        for mode in benchmark.MODES
+    }
+    descriptive = {
+        mode: (
+            {"agent": {"search_retrieval_failure_count": 0}}
+            if mode in benchmark.AGENT_MODES else {}
+        )
+        for mode in benchmark.MODES
+    }
+    paired_report = {
+        "configuration": {},
+        "primary": {
+            "comparison": "search_rl_vs_base_search",
+            "overall": {"difference_pp": 3.125},
+            "interpretation": "Limited paired benchmark interpretation.",
+        },
+        "quality_claim_ready": True,
+        "inference_claim_ready": True,
+        "readiness": {
+            "warning": None,
+            "source_counts": {"nq": 32, "hotpotqa": 32},
+        },
+    }
+
+    monkeypatch.setattr(
+        summary,
+        "parse_args",
+        lambda: SimpleNamespace(
+            results_dir=str(results_dir),
+            eval_manifest=str(manifest_path),
+            output=None,
+        ),
+    )
+    monkeypatch.setattr(
+        summary,
+        "read_result_file",
+        lambda _path, mode: result_sets[mode],
+    )
+    monkeypatch.setattr(
+        summary,
+        "validate_results_against_manifest",
+        lambda *_args: run_configs,
+    )
+    monkeypatch.setattr(summary, "summarize_all", lambda *_args: descriptive)
+    monkeypatch.setattr(summary, "join_paired_results", lambda *_args: ["joined"])
+    monkeypatch.setattr(
+        summary, "analyze_paired_results", lambda *_args: paired_report
+    )
+    monkeypatch.setattr(
+        summary,
+        "validate_joined_against_manifest",
+        lambda *_args: {"passed": True},
+    )
+    monkeypatch.setattr(summary, "render_markdown", lambda *_args: "# Paired\n")
+    monkeypatch.setattr(
+        summary, "sha256_file", lambda path: f"sha256:{Path(path).name}"
+    )
+
+    summary.main()
+
+    paired_json = results_dir / "paired_statistics.json"
+    paired_markdown = results_dir / "paired_statistics.md"
+    summary_payload = json.loads(
+        (results_dir / "summary.json").read_text(encoding="utf-8")
+    )
+    assert paired_json.exists()
+    assert paired_markdown.read_text(encoding="utf-8") == "# Paired\n"
+    assert summary_payload["paired_statistics"]["primary_comparison"] == (
+        "search_rl_vs_base_search"
+    )
+    assert summary_payload["paired_statistics"]["primary_overall"] == {
+        "difference_pp": 3.125
+    }
+    assert set(summary_payload["artifacts"]).issuperset({
+        "paired_statistics_json",
+        "paired_statistics_markdown",
+    })
+    assert summary_payload["artifacts"]["paired_statistics_json"]["path"] == (
+        str(paired_json)
+    )
 
 
 def test_search_behavior_metrics_exclude_retrieval_failure_rows():
@@ -618,6 +955,32 @@ def test_search_behavior_metrics_exclude_retrieval_failure_rows():
     assert metrics["behavior_trajectories_excluded_for_retrieval_failure"] == 1
     assert metrics["mean_number_of_actions"] == 2
     assert metrics["search_retrieval_failure_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "mode", ("direct", "static_rag", "base_search", "search_rl")
+)
+def test_all_mode_records_validate_and_resume_without_recomputation(mode):
+    example = _example("nq:1")
+    record = _record(
+        mode,
+        example.uid,
+        example.data_source,
+        1,
+        1.0,
+        question=example.question,
+        ground_truth=example.ground_truth["target"],
+    )
+
+    benchmark.validate_result_record(record, mode)
+    pending, completed = benchmark.resume_plan(
+        [example],
+        [record],
+        expected_run_fingerprint=record["run_fingerprint"],
+    )
+
+    assert pending == []
+    assert completed == {example.uid: record}
 
 
 def test_mode_results_resume_without_repeating_completed_examples(tmp_path):
@@ -676,6 +1039,15 @@ def test_primary_launcher_is_syntax_valid_sequential_and_keeps_observation_cap()
     source = RUN_SCRIPT.read_text(encoding="utf-8")
     assert 'MAX_OBS_LENGTH="256"' in source
     assert 'STATIC_CONTEXT_TOKEN_BUDGET="512"' in source
-    assert 'run_mode direct\n  run_mode static_rag\n  run_mode search_rl' in source
+    assert (
+        "run_mode direct\n"
+        "  run_mode static_rag\n"
+        "  run_mode base_search\n"
+        "  run_mode search_rl\n"
+        "  summarize"
+    ) in source
+    assert source.count("run_mode base_search") == 1
+    assert "all|direct|static_rag|base_search|search_rl|summarize" in source
     assert "PHASE4_SEARCH_MODEL_PATH" in source
+    assert "PHASE4_BASE_MODEL_PATH" in source
     assert "phase3-qwen2.5-3b-small-real-grpo-training/actor/global_step_20" in source

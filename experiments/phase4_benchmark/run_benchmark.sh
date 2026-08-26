@@ -27,7 +27,7 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-XFORMERS}"
 
 case "${MODE}" in
-  all|direct|static_rag|search_rl|summarize) ;;
+  all|direct|static_rag|base_search|search_rl|summarize) ;;
   *) printf 'Unknown Phase-4 mode: %s\n' "${MODE}" >&2; exit 2 ;;
 esac
 
@@ -46,7 +46,7 @@ command -v "${PYTHON_BIN}" >/dev/null 2>&1 || {
 
 mkdir -p "${RESULTS_DIR}" "$(dirname "${LOG_PATH}")"
 printf '%s\n' \
-  "Phase-4 held-out Direct / Static-RAG / Search-RL benchmark" \
+  "Phase-4 held-out Direct / Static-RAG / Base Search / Search-RL benchmark" \
   "  selected mode: ${MODE}" \
   "  eval data / manifest: ${DATA_DIR}/eval.parquet / ${DATA_DIR}/manifest.json" \
   "  base model: ${BASE_MODEL}" \
@@ -57,7 +57,7 @@ printf '%s\n' \
   "  greedy seed / response tokens: ${SEED} / ${MAX_RESPONSE_LENGTH}" \
   "  retriever URL / top-k: ${RETRIEVER_URL} / ${RETRIEVER_TOPK}" \
   "  Static-RAG retrieved-context token budget: ${STATIC_CONTEXT_TOKEN_BUDGET}" \
-  "  Search-RL turns / observation cap / rolling prompt cap: ${MAX_TURNS} / ${MAX_OBS_LENGTH} / ${MAX_PROMPT_LENGTH}" \
+  "  Search Agent turns / observation cap / rolling prompt cap: ${MAX_TURNS} / ${MAX_OBS_LENGTH} / ${MAX_PROMPT_LENGTH}" \
   "  results / log: ${RESULTS_DIR} / ${LOG_PATH}" \
   "  overwrite completed rows: ${OVERWRITE}" | tee -a "${LOG_PATH}"
 
@@ -98,6 +98,7 @@ if [[ "${MODE}" == "all" ]]; then
   # Process boundaries provide reliable vLLM/CUDA teardown between checkpoints.
   run_mode direct
   run_mode static_rag
+  run_mode base_search
   run_mode search_rl
   summarize
 elif [[ "${MODE}" == "summarize" ]]; then

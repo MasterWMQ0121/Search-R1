@@ -21,7 +21,8 @@ from experiments.phase4_benchmark.prepare_eval_data import sha256_file
 from verl.utils.reward_score import qa_em
 
 
-MODES = ("direct", "static_rag", "search_rl")
+AGENT_MODES = ("base_search", "search_rl")
+MODES = ("direct", "static_rag", "base_search", "search_rl")
 SUPPORTED_SOURCES = ("nq", "hotpotqa")
 SCHEMA_VERSION = 1
 DEFAULT_BASE_MODEL = "/workspace/models/Qwen2.5-3B-Instruct"
@@ -58,6 +59,20 @@ COMMON_RESULT_FIELDS = {
     "run_config",
     "run_fingerprint",
 }
+AGENT_RESULT_FIELDS = {
+    "number_of_actions",
+    "number_of_valid_actions",
+    "number_of_valid_searches",
+    "number_of_successful_retrievals",
+    "finished",
+    "search_retrieval_failure_count",
+    "retrieval_latency_s",
+    "observation_truncation_count",
+    "trajectory_had_observation_truncation",
+    "retrieved_observation_lengths_before_truncation",
+    "retained_observation_lengths_after_truncation",
+    "observation_excess_tokens",
+}
 MODE_RESULT_FIELDS = {
     "direct": set(),
     "static_rag": {
@@ -68,20 +83,8 @@ MODE_RESULT_FIELDS = {
         "retrieved_context_tokens_before_truncation",
         "retrieved_context_tokens_retained",
     },
-    "search_rl": {
-        "number_of_actions",
-        "number_of_valid_actions",
-        "number_of_valid_searches",
-        "number_of_successful_retrievals",
-        "finished",
-        "search_retrieval_failure_count",
-        "retrieval_latency_s",
-        "observation_truncation_count",
-        "trajectory_had_observation_truncation",
-        "retrieved_observation_lengths_before_truncation",
-        "retained_observation_lengths_after_truncation",
-        "observation_excess_tokens",
-    },
+    "base_search": AGENT_RESULT_FIELDS,
+    "search_rl": AGENT_RESULT_FIELDS,
 }
 
 
@@ -136,8 +139,8 @@ def build_run_config(args, mode, model_path, eval_manifest, eval_manifest_path):
         "static_context_token_budget": (
             args.static_context_token_budget if mode == "static_rag" else None
         ),
-        "max_turns": args.max_turns if mode == "search_rl" else None,
-        "max_obs_length": args.max_obs_length if mode == "search_rl" else None,
+        "max_turns": args.max_turns if mode in AGENT_MODES else None,
+        "max_obs_length": args.max_obs_length if mode in AGENT_MODES else None,
     }
 
 
@@ -161,8 +164,8 @@ def _default_test_run_config(mode, model_path):
         "retriever_url": "test" if mode != "direct" else None,
         "retriever_topk": 3 if mode != "direct" else 0,
         "static_context_token_budget": 512 if mode == "static_rag" else None,
-        "max_turns": 2 if mode == "search_rl" else None,
-        "max_obs_length": 256 if mode == "search_rl" else None,
+        "max_turns": 2 if mode in AGENT_MODES else None,
+        "max_obs_length": 256 if mode in AGENT_MODES else None,
     }
 
 
@@ -697,14 +700,16 @@ def _decode_search_trajectory(tokenizer, output):
     return tokenizer.decode(token_ids, skip_special_tokens=True)
 
 
-def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,
-                       topk=3, max_turns=2, max_start_length=768,
-                       max_response_length=128, max_obs_length=256,
-                       max_prompt_length=1408, run_config=None):
+def evaluate_search_agent(example, tokenizer, generator, mode, model_path, search_url,
+                          topk=3, max_turns=2, max_start_length=768,
+                          max_response_length=128, max_obs_length=256,
+                          max_prompt_length=1408, run_config=None):
     import torch
     from search_r1.llm_agent.generation import GenerationConfig, LLMGenerationManager
     from verl import DataProto
 
+    if mode not in AGENT_MODES:
+        raise ValueError(f"unsupported Search Agent mode: {mode!r}")
     started = time.perf_counter()
     rendered = render_chat_prompt(tokenizer, example.search_prompt)
     prompt_ids = encode_prompt(tokenizer, rendered, max_start_length)
@@ -762,7 +767,7 @@ def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,
         if not retrieval_telemetry["failure_count"]:
             raise
         result = _base_result(
-            example, "search_rl", model_path, None, 0,
+            example, mode, model_path, None, 0,
             time.perf_counter() - started, rollout_adapter.generation_latency_s, "",
             run_config,
         )
@@ -791,7 +796,7 @@ def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,
         meta, "retrieval_observation_truncation_stats", 0
     ))
     result = _base_result(
-        example, "search_rl", model_path, prediction, score,
+        example, mode, model_path, prediction, score,
         time.perf_counter() - started, rollout_adapter.generation_latency_s, trajectory,
         run_config,
     )
@@ -818,6 +823,28 @@ def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,
         )),
     })
     return result
+
+
+def evaluate_base_search(example, tokenizer, generator, model_path, search_url,
+                         topk=3, max_turns=2, max_start_length=768,
+                         max_response_length=128, max_obs_length=256,
+                         max_prompt_length=1408, run_config=None):
+    return evaluate_search_agent(
+        example, tokenizer, generator, "base_search", model_path, search_url,
+        topk, max_turns, max_start_length, max_response_length, max_obs_length,
+        max_prompt_length, run_config,
+    )
+
+
+def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,
+                       topk=3, max_turns=2, max_start_length=768,
+                       max_response_length=128, max_obs_length=256,
+                       max_prompt_length=1408, run_config=None):
+    return evaluate_search_agent(
+        example, tokenizer, generator, "search_rl", model_path, search_url,
+        topk, max_turns, max_start_length, max_response_length, max_obs_length,
+        max_prompt_length, run_config,
+    )
 
 
 def validate_result_record(record, expected_mode=None):
@@ -861,10 +888,10 @@ def validate_result_record(record, expected_mode=None):
         raise ValueError("retrieval run_config must use top-k 3")
     if mode == "static_rag" and run_config.get("static_context_token_budget") != 512:
         raise ValueError("Static-RAG run_config must use a 512-token context budget")
-    if mode == "search_rl" and (
+    if mode in AGENT_MODES and (
         run_config.get("max_turns") != 2 or run_config.get("max_obs_length") != 256
     ):
-        raise ValueError("Search-RL run_config must use two turns and max_obs_length 256")
+        raise ValueError("Search Agent run_config must use two turns and max_obs_length 256")
     if record.get("data_source") not in SUPPORTED_SOURCES:
         raise ValueError("result has unsupported data_source")
     if not str(record.get("uid", "")).startswith(f"{record['data_source']}:"):
@@ -899,7 +926,7 @@ def validate_result_record(record, expected_mode=None):
             raise ValueError("Static-RAG context token metrics are invalid")
         if raw < 0 or retained < 0 or retained > raw or retained > budget:
             raise ValueError("Static-RAG context token metrics are inconsistent")
-    if mode == "search_rl":
+    if mode in AGENT_MODES:
         count_keys = (
             "number_of_actions",
             "number_of_valid_actions",
@@ -936,27 +963,27 @@ def validate_result_record(record, expected_mode=None):
             record.get("observation_excess_tokens"),
         )
         if not all(isinstance(values, list) for values in event_lists):
-            raise ValueError("Search-RL observation telemetry must use lists")
+            raise ValueError("Search Agent observation telemetry must use lists")
         if len({len(values) for values in event_lists}) != 1:
-            raise ValueError("Search-RL observation telemetry lists are misaligned")
+            raise ValueError("Search Agent observation telemetry lists are misaligned")
         raw_lengths, retained_lengths, excess_tokens = event_lists
         if len(raw_lengths) != counts["number_of_successful_retrievals"]:
-            raise ValueError("Search-RL observation count does not match retrieval count")
+            raise ValueError("Search Agent observation count does not match retrieval count")
         for raw, retained, excess in zip(raw_lengths, retained_lengths, excess_tokens):
             if not all(
                 isinstance(value, int) and not isinstance(value, bool) and value >= 0
                 for value in (raw, retained, excess)
             ):
-                raise ValueError("Search-RL observation token metrics must be non-negative integers")
+                raise ValueError("Search Agent observation token metrics must be non-negative integers")
             if retained > raw or excess != max(raw - 256, 0):
-                raise ValueError("Search-RL observation token metrics are inconsistent")
+                raise ValueError("Search Agent observation token metrics are inconsistent")
         expected_truncations = sum(
             retained < raw for raw, retained in zip(raw_lengths, retained_lengths)
         )
         if counts["observation_truncation_count"] != expected_truncations:
-            raise ValueError("Search-RL observation truncation count is inconsistent")
+            raise ValueError("Search Agent observation truncation count is inconsistent")
         if record["trajectory_had_observation_truncation"] != (expected_truncations > 0):
-            raise ValueError("Search-RL trajectory truncation flag is inconsistent")
+            raise ValueError("Search Agent trajectory truncation flag is inconsistent")
         if counts["search_retrieval_failure_count"]:
             if record["exact_match"] != 0 or record["prediction"] is not None:
                 raise ValueError("retriever failure rows must not claim a correct prediction")
@@ -1130,8 +1157,8 @@ def main():
         "tensor_parallel_size": 1,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "max_response_length": args.max_response_length,
-        "max_obs_length": args.max_obs_length if args.mode == "search_rl" else None,
-        "max_turns": args.max_turns if args.mode == "search_rl" else None,
+        "max_obs_length": args.max_obs_length if args.mode in AGENT_MODES else None,
+        "max_turns": args.max_turns if args.mode in AGENT_MODES else None,
         "retriever_topk": args.retriever_topk if args.mode != "direct" else 0,
         "static_context_token_budget": (
             args.static_context_token_budget if args.mode == "static_rag" else None
@@ -1158,6 +1185,13 @@ def main():
         evaluate_one = lambda example: evaluate_static_rag(
             example, tokenizer, generator, retriever, model_path,
             args.max_start_length, args.static_context_token_budget,
+            run_config,
+        )
+    elif args.mode == "base_search":
+        evaluate_one = lambda example: evaluate_base_search(
+            example, tokenizer, generator, model_path, args.retriever_url,
+            args.retriever_topk, args.max_turns, args.max_start_length,
+            args.max_response_length, args.max_obs_length, args.max_prompt_length,
             run_config,
         )
     else:
