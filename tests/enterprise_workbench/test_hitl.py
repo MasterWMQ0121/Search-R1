@@ -48,7 +48,6 @@ async def test_write_interrupts_before_side_effect_and_approve_resumes_once(grap
                 {
                     "campaign_id": "C102",
                     "daily_budget": 1200,
-                    "idempotency_key": "thread-write-001",
                 },
             ),
             decision("finalizer", completed=True),
@@ -59,6 +58,9 @@ async def test_write_interrupts_before_side_effect_and_approve_resumes_once(grap
     config = {"configurable": {"thread_id": "write-thread"}, "recursion_limit": 80}
     first = await runtime["graph"].ainvoke(write_state(), config)
     assert "__interrupt__" in first
+    generated_key = first["pending_action"]["arguments"]["idempotency_key"]
+    assert generated_key.startswith("wb-")
+    assert first["approval_request"]["arguments"]["idempotency_key"] == generated_key
     assert budget_and_audits(runtime["database_path"]) == (1000.0, 0)
 
     final = await runtime["graph"].ainvoke(
@@ -82,7 +84,6 @@ async def test_edit_executes_only_validated_edited_arguments(graph_factory):
                 {
                     "campaign_id": "C102",
                     "daily_budget": 1500,
-                    "idempotency_key": "thread-edit-001",
                 },
             ),
             decision("finalizer", completed=True),
@@ -91,7 +92,8 @@ async def test_edit_executes_only_validated_edited_arguments(graph_factory):
         role="operator",
     )
     config = {"configurable": {"thread_id": "write-thread"}, "recursion_limit": 80}
-    await runtime["graph"].ainvoke(write_state(), config)
+    paused = await runtime["graph"].ainvoke(write_state(), config)
+    generated_key = paused["pending_action"]["arguments"]["idempotency_key"]
     await runtime["graph"].ainvoke(
         Command(
             resume={
@@ -99,7 +101,7 @@ async def test_edit_executes_only_validated_edited_arguments(graph_factory):
                 "edited_arguments": {
                     "campaign_id": "C102",
                     "daily_budget": 1200,
-                    "idempotency_key": "thread-edit-001",
+                    "idempotency_key": generated_key,
                 },
             }
         ),
@@ -110,33 +112,18 @@ async def test_edit_executes_only_validated_edited_arguments(graph_factory):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "edited_arguments,error_field",
+    "edit_kind,error_field",
     [
-        (
-            {
-                "campaign_id": "C101",
-                "daily_budget": 1200,
-                "idempotency_key": "thread-edit-immutable",
-            },
-            "campaign_id",
-        ),
-        (
-            {
-                "campaign_id": "C102",
-                "daily_budget": 1200,
-                "idempotency_key": "different-edit-key",
-            },
-            "idempotency_key",
-        ),
+        ("campaign_id", "campaign_id"),
+        ("idempotency_key", "idempotency_key"),
     ],
 )
 async def test_edit_cannot_change_action_target_or_idempotency_identity(
-    graph_factory, edited_arguments, error_field
+    graph_factory, edit_kind, error_field
 ):
     original = {
         "campaign_id": "C102",
         "daily_budget": 1500,
-        "idempotency_key": "thread-edit-immutable",
     }
     runtime = graph_factory(
         [decision("update_campaign_budget", original)],
@@ -144,7 +131,17 @@ async def test_edit_cannot_change_action_target_or_idempotency_identity(
         role="operator",
     )
     config = {"configurable": {"thread_id": "write-thread"}, "recursion_limit": 80}
-    await runtime["graph"].ainvoke(write_state(), config)
+    paused = await runtime["graph"].ainvoke(write_state(), config)
+    generated_key = paused["pending_action"]["arguments"]["idempotency_key"]
+    edited_arguments = {
+        "campaign_id": "C101" if edit_kind == "campaign_id" else "C102",
+        "daily_budget": 1200,
+        "idempotency_key": (
+            "different-edit-key"
+            if edit_kind == "idempotency_key"
+            else generated_key
+        ),
+    }
 
     with pytest.raises(ValueError, match=error_field):
         await runtime["graph"].ainvoke(
@@ -161,11 +158,10 @@ async def test_edit_cannot_change_action_target_or_idempotency_identity(
 
 
 @pytest.mark.asyncio
-async def test_reject_and_viewer_denial_never_write(graph_factory):
+async def test_reject_and_viewer_semantic_denial_never_write(graph_factory):
     arguments = {
         "campaign_id": "C102",
         "daily_budget": 1200,
-        "idempotency_key": "thread-reject-001",
     }
     runtime = graph_factory(
         [decision("update_campaign_budget", arguments), decision("finalizer", completed=True)],
@@ -192,11 +188,15 @@ async def test_reject_and_viewer_denial_never_write(graph_factory):
     )
     assert "__interrupt__" not in viewer_result
     assert budget_and_audits(denied["database_path"]) == (1000.0, 0)
-    assert any(item.get("status") == "denied" for item in viewer_result["tool_results"])
+    assert viewer_result["termination_reason"] == "planner_semantic_error"
+    assert any(
+        error.get("code") == "planner_semantic_error"
+        for error in viewer_result["errors"]
+    )
 
 
 @pytest.mark.asyncio
-async def test_invalid_write_arguments_are_denied_before_interrupt(graph_factory):
+async def test_invalid_write_arguments_fail_semantically_before_interrupt(graph_factory):
     runtime = graph_factory(
         [
             decision(
@@ -204,7 +204,6 @@ async def test_invalid_write_arguments_are_denied_before_interrupt(graph_factory
                 {
                     "campaign_id": "C102",
                     "daily_budget": "not-a-number",
-                    "idempotency_key": "invalid-write-001",
                 },
             ),
             decision("finalizer", completed=True),
@@ -218,7 +217,10 @@ async def test_invalid_write_arguments_are_denied_before_interrupt(graph_factory
     )
     assert "__interrupt__" not in result
     assert budget_and_audits(runtime["database_path"]) == (1000.0, 0)
-    assert any(error.get("code") == "invalid_arguments" for error in result["errors"])
+    assert result["termination_reason"] == "planner_semantic_error"
+    assert any(
+        error.get("code") == "planner_semantic_error" for error in result["errors"]
+    )
 
 
 @pytest.mark.asyncio

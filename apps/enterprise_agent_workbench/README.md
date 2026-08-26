@@ -81,8 +81,8 @@ chain-of-thought is neither requested nor retained.
 - Planning: `plan`, `next_action`, `action_arguments`, `pending_action`.
 - Evidence: `tool_results`, `sources`.
 - Control: `approval_request`, `approval_decision`, `step_count`,
-  `tool_call_count`, `research_search_count`, `planner_repair_count`, `route`,
-  `authorization_route`.
+  `tool_call_count`, `research_search_count`, `planner_repair_count`,
+  `planner_failure_signatures`, `route`, `authorization_route`.
 - Outcome: `errors`, `final_answer`, `final_citations`, `completed`,
   `termination_reason`, `citation_coverage`.
 - Audit: `execution_trace`.
@@ -106,11 +106,13 @@ also enforce their own lower per-tool timeouts.
 and `summarize_memory` operations. Production uses
 `VLLMHTTPModelClient`; CPU tests use the deterministic `FakeModelClient`.
 
-Planner output is Pydantic-validated JSON containing an objective, one next
-action, arguments, a completed flag, and a user-visible reason. The client
-extracts one JSON object, validates it, performs at most one deterministic
-repair request, and raises `planner_parse_error` if repair also fails. It never
-fabricates a successful tool choice.
+Planner output is Pydantic-validated JSON containing an objective, one exact
+registered action ID, arguments, a completed flag, and a user-visible reason.
+Each call receives only the enabled, role-visible compact tool contracts plus
+`finalizer`. Syntax/schema and semantic action/argument failures share one
+deterministic repair request. A failed repair terminates as
+`planner_parse_error`, `planner_semantic_error`, or `planner_stuck`; an action
+description is never silently rewritten into an authorized tool choice.
 
 Configure the separate model endpoint with:
 
@@ -146,16 +148,19 @@ function.
 | operator | yes | yes | yes | yes | yes |
 | admin | yes | yes | yes | yes | yes |
 
-All registered writes remain approval-required for operator and admin. Policy
-also checks that the tool exists, is enabled, the run remains within budget,
-and a side-effecting action carries an idempotency key. A denied tool never
-executes; denial becomes both a user-visible response and a structured audit
-event that the planner can use safely.
+All registered writes remain approval-required for operator and admin. The
+planner supplies only business arguments; the graph derives a deterministic,
+run-bound idempotency key before policy. Policy also checks that the tool
+exists, is enabled, the run remains within budget, and a side-effecting action
+carries that key. A denied tool never executes. If the same action receives the
+same policy denial twice, the graph stops with `planner_stuck` instead of using
+the framework recursion limit as control flow.
 
 ## Human approval lifecycle
 
-1. The planner proposes a side-effecting tool and arguments.
-2. Policy validates role, risk, budgets, schema, and idempotency key.
+1. The planner proposes an exact side-effecting tool ID and business arguments.
+2. The graph validates the real tool schema and injects its deterministic
+   idempotency key; policy then validates role, risk, budgets, schema, and key.
 3. The graph includes current campaign state in the approval card when an
    earlier read made it available; the transactional API always records the
    authoritative before state at execution.

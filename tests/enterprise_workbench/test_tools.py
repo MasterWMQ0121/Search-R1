@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -414,3 +415,159 @@ async def test_side_effect_timeout_reconciles_real_transaction_outcome(demo_data
 def test_initialize_refuses_implicit_overwrite(demo_database):
     with pytest.raises(FileExistsError, match="overwrite=True"):
         initialize_demo_database(demo_database, SEED_PATH)
+
+
+def test_planner_catalog_is_compact_role_aware_and_hides_control_fields(
+    demo_database,
+):
+    kb = EnterpriseKnowledgeBase(DOCS_DIR)
+    research, _, _ = _research_tool()
+    registry = build_default_registry(
+        kb, research, MerchantAnalytics(demo_database), CampaignAPI(demo_database)
+    )
+    safe_before = registry.safe_metadata()
+
+    viewer_catalog = registry.planner_metadata("viewer")
+    analyst_names = set(registry.planner_action_ids("analyst"))
+    operator_catalog = registry.planner_metadata("operator")
+    viewer_names = {item["name"] for item in viewer_catalog}
+    operator_by_name = {item["name"]: item for item in operator_catalog}
+
+    assert "enterprise_kb_search" in viewer_names
+    assert "get_campaign" in viewer_names
+    assert "compare_periods" not in viewer_names
+    assert "update_campaign_budget" not in viewer_names
+    assert "compare_periods" in analyst_names
+    assert "update_campaign_budget" not in analyst_names
+
+    budget = operator_by_name["update_campaign_budget"]
+    assert list(budget) == [
+        "name",
+        "description",
+        "category",
+        "risk_level",
+        "approval_required",
+        "side_effecting",
+        "arguments",
+    ]
+    assert budget["description"] == "Change a campaign daily budget."
+    assert budget["category"] == "business_write"
+    assert budget["risk_level"] == "high"
+    assert budget["approval_required"] is True
+    assert budget["side_effecting"] is True
+    assert budget["arguments"] == {
+        "campaign_id": {"type": "string", "required": True},
+        "daily_budget": {
+            "type": "number",
+            "maximum": 1_000_000.0,
+            "exclusiveMinimum": 0.0,
+            "required": True,
+        },
+    }
+    serialized = json.dumps(operator_catalog)
+    for forbidden in (
+        "idempotency_key",
+        "input_schema",
+        "output_schema",
+        "required_roles",
+        "timeout_seconds",
+        "source_producing",
+        '"enabled"',
+        '"title": "',
+        '"$defs"',
+    ):
+        assert forbidden not in serialized
+
+    # The Planner-only view must not alter the existing UI/audit API contract.
+    assert registry.safe_metadata() == safe_before
+    safe_budget = next(
+        item for item in safe_before if item["name"] == "update_campaign_budget"
+    )
+    assert "idempotency_key" in safe_budget["input_schema"]["properties"]
+    assert "output_schema" in safe_budget
+
+
+def test_planner_catalog_excludes_disabled_tools_and_rejects_unknown_roles(
+    demo_database,
+):
+    kb = EnterpriseKnowledgeBase(DOCS_DIR)
+    research, _, _ = _research_tool()
+    default = build_default_registry(
+        kb, research, MerchantAnalytics(demo_database), CampaignAPI(demo_database)
+    )
+    disabled = replace(default.get("get_campaign"), enabled=False)
+    registry = ToolRegistry(
+        [
+            disabled if item["name"] == disabled.name else default.get(item["name"])
+            for item in default.safe_metadata()
+        ]
+    )
+
+    assert "get_campaign" not in registry.planner_action_ids("viewer")
+    with pytest.raises(ValueError, match="unknown Planner role"):
+        registry.planner_metadata("superuser")
+    with pytest.raises(ValueError, match="not available"):
+        registry.validate_planner_arguments(
+            "viewer", "get_campaign", {"campaign_id": "C102"}
+        )
+
+
+def test_planner_arguments_use_real_schema_without_accepting_idempotency_metadata(
+    demo_database,
+):
+    kb = EnterpriseKnowledgeBase(DOCS_DIR)
+    research, _, _ = _research_tool()
+    registry = build_default_registry(
+        kb, research, MerchantAnalytics(demo_database), CampaignAPI(demo_database)
+    )
+
+    assert registry.validate_planner_arguments(
+        "operator",
+        "update_campaign_budget",
+        {"campaign_id": "C102", "daily_budget": 1200},
+    ) == {"campaign_id": "C102", "daily_budget": 1200.0}
+    assert registry.validate_planner_arguments(
+        "viewer", "list_campaigns", {}
+    ) == {"status": None, "limit": 50}
+    assert registry.validate_planner_arguments(
+        "analyst",
+        "compare_periods",
+        {
+            "campaign_id": "C102",
+            "current_start": "2026-08-08",
+            "current_end": "2026-08-14",
+            "previous_start": "2026-08-01",
+            "previous_end": "2026-08-07",
+        },
+    )["current_start"] == "2026-08-08"
+
+    with pytest.raises(ValueError, match="daily_budget: Field required"):
+        registry.validate_planner_arguments(
+            "operator", "update_campaign_budget", {"campaign_id": "C102"}
+        )
+    with pytest.raises(ValueError, match="objective: Extra inputs are not permitted"):
+        registry.validate_planner_arguments(
+            "operator",
+            "update_campaign_budget",
+            {
+                "campaign_id": "C102",
+                "daily_budget": 1200,
+                "objective": "Increase the budget",
+            },
+        )
+    with pytest.raises(ValueError, match="control-plane metadata"):
+        registry.validate_planner_arguments(
+            "operator",
+            "update_campaign_budget",
+            {
+                "campaign_id": "C102",
+                "daily_budget": 1200,
+                "idempotency_key": "llm-invented-key",
+            },
+        )
+    with pytest.raises(ValueError, match="not available"):
+        registry.validate_planner_arguments(
+            "viewer",
+            "update_campaign_budget",
+            {"campaign_id": "C102", "daily_budget": 1200},
+        )

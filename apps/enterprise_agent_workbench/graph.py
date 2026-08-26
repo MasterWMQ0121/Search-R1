@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -14,7 +16,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import WorkbenchSettings
 from .citations import citation_coverage, validate_citations
-from .model_client import PlannerParseError, WorkbenchModelClient
+from .model_client import (
+    PlannerDecision,
+    PlannerParseError,
+    PlannerSemanticValidationError,
+    WorkbenchModelClient,
+    validate_planner_decision,
+)
 from .policy import PolicyEngine
 from .state import AgentState
 from .tool_registry import ToolRegistry
@@ -26,8 +34,12 @@ READ_NODE_ALIASES = {
     "merchant_analytics": "merchant_analytics",
     "campaign_read": "campaign_read",
 }
-FINAL_ACTIONS = {"finalizer", "finish", "complete", "final_answer"}
+FINAL_ACTIONS = {"finalizer"}
 CITATION_PATTERN = re.compile(r"\[([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\]")
+PLANNER_FAILURE_ANSWER = (
+    "The workbench stopped safely because the planner could not select a valid "
+    "permitted action. No business action was executed."
+)
 
 
 class ApprovalResume(BaseModel):
@@ -62,6 +74,42 @@ def _safe_summary(value: Any, *, limit: int = 400) -> str:
             rf"(?i)({marker}\s*['\"=:]+)\S+", r"\1[REDACTED]", text
         )
     return text[:limit]
+
+
+def deterministic_idempotency_key(
+    *,
+    organization_id: str,
+    user_id: str,
+    thread_id: str,
+    run_id: str,
+    action: str,
+    business_arguments: dict[str, Any],
+) -> str:
+    """Bind one control-plane write identity to a run and canonical arguments."""
+
+    payload = {
+        "schema_version": 1,
+        "organization_id": organization_id,
+        "user_id": user_id,
+        "thread_id": thread_id,
+        "run_id": run_id,
+        "action": action,
+        "business_arguments": business_arguments,
+    }
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "wb-" + hashlib.sha256(canonical).hexdigest()
+
+
+def _failure_signature(code: str, action: str) -> str:
+    normalized = " ".join(str(action).split()).casefold()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
+    return f"{code}:{digest}"
 
 
 def _trace(
@@ -271,11 +319,25 @@ class WorkbenchGraph:
         )
         return {**self._step(state, event), "user_preferences": preferences}
 
+    def _validate_planner_tool_contract(
+        self, role: str, decision: PlannerDecision
+    ) -> PlannerDecision:
+        if decision.next_action == "finalizer":
+            return decision
+        arguments = self.registry.validate_planner_arguments(
+            role, decision.next_action, decision.arguments
+        )
+        return decision.model_copy(update={"arguments": arguments})
+
     def _planner_context(self, state: AgentState) -> dict[str, Any]:
+        role = state.get("role", "viewer")
         return {
             "conversation_summary": state.get("conversation_summary", ""),
             "preferences": state.get("user_preferences", {}),
-            "available_tools": self.registry.safe_metadata(),
+            "available_tools": self.registry.planner_metadata(role),
+            "_planner_decision_validator": (
+                lambda decision: self._validate_planner_tool_contract(role, decision)
+            ),
             "prior_tool_results": state.get("tool_results", [])[-6:],
             "errors": state.get("errors", [])[-3:],
             "limits": {
@@ -294,6 +356,7 @@ class WorkbenchGraph:
     async def _decide(self, state: AgentState, *, replan: bool) -> dict[str, Any]:
         node = "replanner" if replan else "planner"
         started = time.perf_counter()
+        planner_context = self._planner_context(state)
         if hasattr(self.model_client, "repair_allowed"):
             self.model_client.repair_allowed = (
                 int(state.get("planner_repair_count", 0))
@@ -302,15 +365,25 @@ class WorkbenchGraph:
         try:
             if replan:
                 decision = await self.model_client.replan(
-                    state["task"], self._planner_context(state)
+                    state["task"], planner_context
                 )
             else:
                 decision = await self.model_client.plan(
-                    state["task"], self._planner_context(state)
+                    state["task"], planner_context
                 )
         except PlannerParseError as error:
+            failure_signatures = list(
+                getattr(self.model_client, "last_planner_failure_signatures", [])
+            )
+            prior_signatures = list(state.get("planner_failure_signatures", []))
+            error_code = str(getattr(error, "code", "planner_parse_error"))
+            if error_code in {"planner_semantic_error", "planner_stuck"} and (
+                error_code == "planner_stuck"
+                or any(signature in prior_signatures for signature in failure_signatures)
+            ):
+                error_code = "planner_stuck"
             failure = {
-                "code": "planner_parse_error",
+                "code": error_code,
                 "message": str(error),
                 "node": node,
             }
@@ -329,9 +402,14 @@ class WorkbenchGraph:
                 "errors": [failure],
                 "next_action": "finalizer",
                 "action_arguments": {},
-                "termination_reason": "planner_parse_error",
+                "completed": False,
+                "termination_reason": error_code,
                 "planner_repair_count": int(state.get("planner_repair_count", 0))
                 + int(getattr(error, "repair_attempts", 0)),
+                "planner_failure_signatures": [
+                    *prior_signatures,
+                    *failure_signatures,
+                ],
             }
         except Exception as error:
             failure = {
@@ -355,6 +433,114 @@ class WorkbenchGraph:
                 "action_arguments": {},
                 "termination_reason": "planner_backend_error",
             }
+        failure_signatures = list(
+            getattr(self.model_client, "last_planner_failure_signatures", [])
+        )
+        prior_signatures = list(state.get("planner_failure_signatures", []))
+        if any(signature in prior_signatures for signature in failure_signatures):
+            error = PlannerSemanticValidationError(
+                "the same Planner semantic failure repeated in this run",
+                signature=next(
+                    signature
+                    for signature in failure_signatures
+                    if signature in prior_signatures
+                ),
+            )
+            failure = {
+                "code": "planner_stuck",
+                "message": str(error),
+                "node": node,
+            }
+            event = _trace(
+                state,
+                "run_failed",
+                node,
+                status="failed",
+                duration_ms=(time.perf_counter() - started) * 1_000,
+                error_type=type(error).__name__,
+                output_summary=error,
+                retry_number=int(
+                    getattr(self.model_client, "last_planner_repairs", 0)
+                ),
+            )
+            return {
+                **self._step(state, event),
+                "errors": [failure],
+                "next_action": "finalizer",
+                "action_arguments": {},
+                "completed": False,
+                "termination_reason": "planner_stuck",
+                "planner_repair_count": int(state.get("planner_repair_count", 0))
+                + int(getattr(self.model_client, "last_planner_repairs", 0)),
+                "planner_failure_signatures": [
+                    *prior_signatures,
+                    *failure_signatures,
+                ],
+            }
+
+        try:
+            # Defense in depth for test/deterministic clients as well as the live
+            # HTTP client, which already performs this validation before repair.
+            decision = validate_planner_decision(decision, planner_context)
+            action = decision.next_action
+            if action == "finalizer":
+                action_arguments: dict[str, Any] = {}
+            else:
+                business_arguments = self.registry.validate_planner_arguments(
+                    state.get("role", "viewer"), action, decision.arguments
+                )
+                spec = self.registry.get(action)
+                if spec.side_effecting:
+                    idempotency_key = deterministic_idempotency_key(
+                        organization_id=state["organization_id"],
+                        user_id=state["user_id"],
+                        thread_id=state["thread_id"],
+                        run_id=state["run_id"],
+                        action=action,
+                        business_arguments=business_arguments,
+                    )
+                    action_arguments = spec.input_model.model_validate(
+                        {
+                            **business_arguments,
+                            "idempotency_key": idempotency_key,
+                        }
+                    ).model_dump(mode="json")
+                else:
+                    action_arguments = business_arguments
+        except (PlannerSemanticValidationError, ValueError, ValidationError) as error:
+            signature = getattr(
+                error,
+                "signature",
+                _failure_signature("planner_semantic_error", decision.next_action),
+            )
+            error_code = (
+                "planner_stuck" if signature in prior_signatures else "planner_semantic_error"
+            )
+            event = _trace(
+                state,
+                "run_failed",
+                node,
+                status="failed",
+                duration_ms=(time.perf_counter() - started) * 1_000,
+                error_type=type(error).__name__,
+                output_summary=error,
+            )
+            return {
+                **self._step(state, event),
+                "errors": [
+                    {"code": error_code, "message": str(error), "node": node}
+                ],
+                "next_action": "finalizer",
+                "action_arguments": {},
+                "completed": False,
+                "termination_reason": error_code,
+                "planner_failure_signatures": [
+                    *prior_signatures,
+                    *failure_signatures,
+                    signature,
+                ],
+            }
+
         payload = decision.model_dump(mode="json")
         decision_event = _trace(
             state,
@@ -375,7 +561,9 @@ class WorkbenchGraph:
                     state,
                     "planner_repair",
                     node,
-                    output_summary="accepted one schema-repaired planner response",
+                    output_summary=(
+                        "accepted one schema/semantic-repaired planner response"
+                    ),
                     retry_number=1,
                 )
             )
@@ -384,10 +572,14 @@ class WorkbenchGraph:
             **self._step(state, *events),
             "plan": [*state.get("plan", []), payload],
             "next_action": decision.next_action,
-            "action_arguments": decision.arguments,
+            "action_arguments": action_arguments,
             "completed": bool(decision.completed),
             "planner_repair_count": int(state.get("planner_repair_count", 0))
             + repair_count,
+            "planner_failure_signatures": [
+                *prior_signatures,
+                *failure_signatures,
+            ],
         }
 
     async def planner(self, state: AgentState) -> dict[str, Any]:
@@ -399,10 +591,6 @@ class WorkbenchGraph:
     def _action_and_arguments(self, state: AgentState) -> tuple[str, dict[str, Any]]:
         action = str(state.get("next_action") or "")
         arguments = dict(state.get("action_arguments") or {})
-        if action in {"merchant_analytics", "campaign_read", "propose_business_write"}:
-            operation = arguments.pop("operation", None) or arguments.pop("action", None)
-            if isinstance(operation, str) and operation:
-                action = operation
         return action, arguments
 
     async def policy_and_route(self, state: AgentState) -> dict[str, Any]:
@@ -451,6 +639,8 @@ class WorkbenchGraph:
             output_summary=decision["user_message"],
         )
         if not decision["allowed"]:
+            signature = _failure_signature(decision["decision_code"], action)
+            prior_signatures = list(state.get("planner_failure_signatures", []))
             denial = {
                 "tool_name": action,
                 "status": "denied",
@@ -458,10 +648,40 @@ class WorkbenchGraph:
                 "message": decision["user_message"],
                 "sources": [],
             }
+            if signature in prior_signatures:
+                stuck_event = _trace(
+                    state,
+                    "run_failed",
+                    "policy_and_route",
+                    status="failed",
+                    tool_name=action,
+                    error_type="PlannerStuckError",
+                    output_summary=(
+                        "identical policy denial repeated; stopped before replanning"
+                    ),
+                )
+                return {
+                    **self._step(state, event, stuck_event),
+                    "route": "finalizer",
+                    "tool_results": [denial],
+                    "errors": [
+                        {
+                            "code": "planner_stuck",
+                            "tool_name": action,
+                            "message": (
+                                "The same policy-denied action repeated in this run."
+                            ),
+                        }
+                    ],
+                    "completed": False,
+                    "termination_reason": "planner_stuck",
+                    "planner_failure_signatures": prior_signatures,
+                }
             return {
                 **self._step(state, event),
                 "route": "merge_evidence",
                 "tool_results": [denial],
+                "planner_failure_signatures": [*prior_signatures, signature],
             }
         spec = self.registry.get(action)
         if spec.side_effecting:
@@ -847,6 +1067,32 @@ class WorkbenchGraph:
         pending = dict(state.get("pending_action") or {})
         action = str(pending.get("action", ""))
         arguments = dict(pending.get("arguments") or {})
+        approval_decision = (state.get("approval_decision") or {}).get("decision")
+        if approval_decision not in {"approve", "edit"}:
+            error = PermissionError(
+                "business write execution requires a recorded approve/edit decision"
+            )
+            event = _trace(
+                state,
+                "run_failed",
+                "execute_business_write",
+                status="failed",
+                tool_name=action,
+                error_type=type(error).__name__,
+                output_summary=error,
+            )
+            return {
+                **self._step(state, event),
+                "errors": [
+                    {
+                        "code": "business_write_not_approved",
+                        "tool_name": action,
+                        "message": str(error),
+                    }
+                ],
+                "completed": False,
+                "termination_reason": "business_write_not_approved",
+            }
         started = time.perf_counter()
         start_event = _trace(
             state,
@@ -972,6 +1218,26 @@ class WorkbenchGraph:
 
     async def finalizer(self, state: AgentState) -> dict[str, Any]:
         started = time.perf_counter()
+        if state.get("termination_reason") in {
+            "planner_semantic_error",
+            "planner_stuck",
+        }:
+            answer = PLANNER_FAILURE_ANSWER
+            event = _trace(
+                state,
+                "run_failed",
+                "finalizer",
+                status="failed",
+                duration_ms=(time.perf_counter() - started) * 1_000,
+                error_type=str(state.get("termination_reason")),
+                output_summary="deterministic local planner failure answer created",
+            )
+            return {
+                **self._step(state, event),
+                "final_answer": answer,
+                "messages": [{"role": "assistant", "content": answer}],
+                "completed": False,
+            }
         try:
             answer = await self.model_client.synthesize(
                 state["task"],
@@ -1054,10 +1320,15 @@ class WorkbenchGraph:
                     }
                 ],
             }
+        terminal_failure = state.get("termination_reason") not in {None, "completed"}
         event = _trace(
             state,
-            "run_completed",
+            "run_failed" if terminal_failure else "run_completed",
             "citation_validation",
+            status="failed" if terminal_failure else "completed",
+            error_type=(
+                str(state.get("termination_reason")) if terminal_failure else None
+            ),
             output_summary=f"validated {len(result.cited_ids)} citation markers",
         )
         coverage = citation_coverage(answer)
@@ -1074,4 +1345,5 @@ __all__ = [
     "ApprovalResume",
     "ResearchState",
     "WorkbenchGraph",
+    "deterministic_idempotency_key",
 ]

@@ -621,6 +621,7 @@ class WorkbenchService:
                 "tool_call_count": 0,
                 "research_search_count": 0,
                 "planner_repair_count": 0,
+                "planner_failure_signatures": [],
                 "final_answer": None,
                 "final_citations": [],
                 "citation_coverage": 0.0,

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import json
-import os
 import hashlib
+import json
+import math
+import os
 import re
 from collections import deque
 from collections.abc import Sequence
@@ -42,15 +43,43 @@ PlanDecision = PlannerDecision
 class PlannerParseError(RuntimeError):
     """Raised after the one permitted planner-output repair also fails."""
 
+    code = "planner_parse_error"
+
     def __init__(
         self, first_error: str, repair_error: str, *, repair_attempts: int = 1
     ) -> None:
         super().__init__(
-            f"planner_parse_error after {repair_attempts} repair attempt(s): "
+            f"{self.code} after {repair_attempts} repair attempt(s): "
             f"initial={first_error}; repair={repair_error}"
         )
-        self.code = "planner_parse_error"
         self.repair_attempts = repair_attempts
+
+
+class PlannerSemanticError(PlannerParseError):
+    """Raised when the one repair cannot satisfy the Planner tool contract."""
+
+    code = "planner_semantic_error"
+
+
+class PlannerStuckError(PlannerSemanticError):
+    """Raised when initial and repaired decisions repeat one semantic failure."""
+
+    code = "planner_stuck"
+
+
+class PlannerSemanticValidationError(ValueError):
+    """A concise, safe semantic error suitable for one repair prompt."""
+
+    def __init__(self, message: str, *, signature: str) -> None:
+        super().__init__(message)
+        self.signature = signature
+
+
+def _failure_signature(code: str, value: Any) -> str:
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), default=str
+    ).casefold()
+    return f"{code}:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:16]}"
 
 
 @runtime_checkable
@@ -95,9 +124,301 @@ def parse_planner_decision(text: str) -> PlannerDecision:
 
 def _concise_validation_error(error: Exception) -> str:
     if isinstance(error, ValidationError):
-        fields = sorted({".".join(str(part) for part in item["loc"]) for item in error.errors()})
+        fields = sorted(
+            {".".join(str(part) for part in item["loc"]) for item in error.errors()}
+        )
         return "invalid planner fields: " + ", ".join(fields)
     return str(error)[:300]
+
+
+def _planner_catalog(context: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the caller-provided compact catalog or fail closed."""
+
+    catalog = context.get("available_tools")
+    if not isinstance(catalog, list):
+        raise PlannerSemanticValidationError(
+            "planner context must provide an available_tools catalog",
+            signature=_failure_signature("planner_catalog", "missing"),
+        )
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(catalog):
+        if not isinstance(item, dict):
+            raise PlannerSemanticValidationError(
+                f"available_tools[{index}] must be an object",
+                signature=_failure_signature("planner_catalog", [index, "item"]),
+            )
+        name = item.get("name")
+        arguments = item.get("arguments")
+        if not isinstance(name, str) or not name.strip() or name != name.strip():
+            raise PlannerSemanticValidationError(
+                f"available_tools[{index}].name must be a canonical non-blank string",
+                signature=_failure_signature("planner_catalog", [index, "name"]),
+            )
+        if name == "finalizer":
+            raise PlannerSemanticValidationError(
+                "finalizer is reserved and must not appear in available_tools",
+                signature=_failure_signature("planner_catalog", "finalizer"),
+            )
+        if name in seen:
+            raise PlannerSemanticValidationError(
+                f"available_tools contains duplicate action {name!r}",
+                signature=_failure_signature("planner_catalog", ["duplicate", name]),
+            )
+        if not isinstance(arguments, dict):
+            raise PlannerSemanticValidationError(
+                f"available_tools[{index}].arguments must be an object",
+                signature=_failure_signature("planner_catalog", [index, "arguments"]),
+            )
+        seen.add(name)
+        normalized.append(item)
+    return normalized
+
+
+def _value_matches_json_type(value: Any, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "number":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "null":
+        return value is None
+    return False
+
+
+def _argument_constraint_errors(
+    field: str, value: Any, contract: dict[str, Any]
+) -> list[str]:
+    errors: list[str] = []
+    expected_type = contract.get("type")
+    if not isinstance(expected_type, str):
+        return [f"contract for arguments.{field} has no supported type"]
+    required = contract.get("required") is True
+    if value is None and not required:
+        return errors
+    if not _value_matches_json_type(value, expected_type):
+        return [f"arguments.{field} must be {expected_type}"]
+
+    enum = contract.get("enum")
+    if isinstance(enum, list) and value not in enum:
+        errors.append(f"arguments.{field} must be one of {enum!r}")
+
+    if isinstance(value, str):
+        minimum_length = contract.get("minLength")
+        maximum_length = contract.get("maxLength")
+        if isinstance(minimum_length, int) and len(value) < minimum_length:
+            errors.append(
+                f"arguments.{field} must contain at least {minimum_length} characters"
+            )
+        if isinstance(maximum_length, int) and len(value) > maximum_length:
+            errors.append(
+                f"arguments.{field} must contain at most {maximum_length} characters"
+            )
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        comparisons = (
+            ("minimum", lambda candidate, boundary: candidate < boundary, ">="),
+            ("maximum", lambda candidate, boundary: candidate > boundary, "<="),
+            (
+                "exclusiveMinimum",
+                lambda candidate, boundary: candidate <= boundary,
+                ">",
+            ),
+            (
+                "exclusiveMaximum",
+                lambda candidate, boundary: candidate >= boundary,
+                "<",
+            ),
+        )
+        for key, invalid, operator in comparisons:
+            boundary = contract.get(key)
+            if (
+                isinstance(boundary, (int, float))
+                and not isinstance(boundary, bool)
+                and invalid(value, boundary)
+            ):
+                errors.append(f"arguments.{field} must be {operator} {boundary}")
+    return errors
+
+
+def validate_planner_decision(
+    decision: PlannerDecision, context: dict[str, Any]
+) -> PlannerDecision:
+    """Validate exact action and compact input semantics supplied by the caller."""
+
+    catalog = _planner_catalog(context)
+    contracts = {item["name"]: item for item in catalog}
+    allowed = sorted([*contracts, "finalizer"])
+    if decision.completed != (decision.next_action == "finalizer"):
+        raise PlannerSemanticValidationError(
+            'completed=true if and only if next_action="finalizer"',
+            signature=_failure_signature(
+                "completion_contract",
+                [decision.next_action, decision.completed],
+            ),
+        )
+    if decision.next_action not in contracts and decision.next_action != "finalizer":
+        raise PlannerSemanticValidationError(
+            f"next_action must exactly equal one of {allowed!r}; descriptions are invalid",
+            signature=_failure_signature(
+                "unknown_action", " ".join(decision.next_action.split())
+            ),
+        )
+    if decision.next_action == "finalizer":
+        if decision.arguments:
+            raise PlannerSemanticValidationError(
+                "arguments must be empty when next_action is finalizer",
+                signature=_failure_signature(
+                    "finalizer_arguments", sorted(decision.arguments)
+                ),
+            )
+        return decision
+
+    argument_contracts = contracts[decision.next_action]["arguments"]
+    if "idempotency_key" in decision.arguments:
+        raise PlannerSemanticValidationError(
+            "arguments.idempotency_key is control-plane metadata and must be omitted",
+            signature=_failure_signature(
+                "control_plane_argument", [decision.next_action, "idempotency_key"]
+            ),
+        )
+    required = {
+        name
+        for name, contract in argument_contracts.items()
+        if isinstance(contract, dict) and contract.get("required") is True
+    }
+    supplied = set(decision.arguments)
+    missing = sorted(required - supplied)
+    extra = sorted(supplied - set(argument_contracts))
+    errors: list[str] = []
+    if missing:
+        errors.append("missing required arguments: " + ", ".join(missing))
+    if extra:
+        errors.append("unexpected arguments: " + ", ".join(extra))
+    for field in sorted(supplied & set(argument_contracts)):
+        contract = argument_contracts[field]
+        if not isinstance(contract, dict):
+            errors.append(f"contract for arguments.{field} must be an object")
+            continue
+        errors.extend(
+            _argument_constraint_errors(field, decision.arguments[field], contract)
+        )
+    if errors:
+        raise PlannerSemanticValidationError(
+            "; ".join(errors),
+            signature=_failure_signature(
+                "invalid_arguments",
+                [decision.next_action, sorted(errors)],
+            ),
+        )
+    return decision
+
+
+def _validate_with_caller_contract(
+    decision: PlannerDecision, context: dict[str, Any]
+) -> PlannerDecision:
+    """Apply compact semantics and the caller's real tool-schema validator."""
+
+    decision = validate_planner_decision(decision, context)
+    validator = context.get("_planner_decision_validator")
+    if validator is None:
+        return decision
+    if not callable(validator):
+        raise PlannerSemanticValidationError(
+            "planner decision validator must be callable",
+            signature=_failure_signature("planner_validator", "not_callable"),
+        )
+    try:
+        validated = validator(decision)
+    except PlannerSemanticValidationError:
+        raise
+    except (ValidationError, ValueError, TypeError) as error:
+        raise PlannerSemanticValidationError(
+            str(error)[:1_000],
+            signature=_failure_signature(
+                "tool_arguments", [decision.next_action, str(error)[:1_000]]
+            ),
+        ) from error
+    if not isinstance(validated, PlannerDecision):
+        raise PlannerSemanticValidationError(
+            "planner decision validator must return PlannerDecision",
+            signature=_failure_signature("planner_validator", "invalid_return"),
+        )
+    return validated
+
+
+def _sample_value(contract: dict[str, Any]) -> Any:
+    enum = contract.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    return {
+        "string": "C102",
+        "number": 1200,
+        "integer": 3,
+        "boolean": True,
+        "array": [],
+        "object": {},
+    }.get(contract.get("type"), "value")
+
+
+def _valid_example(catalog: list[dict[str, Any]]) -> dict[str, Any]:
+    if not catalog:
+        return {
+            "objective": "Answer the user's request.",
+            "next_action": "finalizer",
+            "arguments": {},
+            "completed": True,
+            "user_visible_reason": "No additional tool call is needed.",
+        }
+    tool = catalog[0]
+    arguments = {
+        field: _sample_value(contract)
+        for field, contract in tool["arguments"].items()
+        if isinstance(contract, dict) and contract.get("required") is True
+    }
+    return {
+        "objective": "Complete the user's request.",
+        "next_action": tool["name"],
+        "arguments": arguments,
+        "completed": False,
+        "user_visible_reason": "This exact tool is needed next.",
+    }
+
+
+def _relevant_contracts(
+    invalid_response: str, catalog: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Select exact/standalone action hints without authorizing a rewrite."""
+
+    try:
+        candidate = extract_json_object(invalid_response).get("next_action")
+    except ValueError:
+        candidate = None
+    if not isinstance(candidate, str):
+        return catalog
+    exact = [item for item in catalog if item["name"] == candidate]
+    if exact:
+        return exact
+    hints = [
+        item
+        for item in catalog
+        if re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(item['name'])}(?![A-Za-z0-9_])",
+            candidate,
+        )
+    ]
+    return hints if len(hints) == 1 else catalog
 
 
 class VLLMHTTPModelClient:
@@ -128,6 +449,9 @@ class VLLMHTTPModelClient:
         self._repair_allowed = ContextVar[bool](
             f"workbench_repair_allowed_{id(self)}", default=True
         )
+        self._last_planner_failure_signatures = ContextVar[tuple[str, ...]](
+            f"workbench_planner_failure_signatures_{id(self)}", default=()
+        )
 
     @property
     def last_planner_repairs(self) -> int:
@@ -144,6 +468,16 @@ class VLLMHTTPModelClient:
     @repair_allowed.setter
     def repair_allowed(self, value: bool) -> None:
         self._repair_allowed.set(bool(value))
+
+    @property
+    def last_planner_failure_signatures(self) -> list[str]:
+        return list(self._last_planner_failure_signatures.get())
+
+    def _record_semantic_failure(
+        self, error: PlannerSemanticValidationError
+    ) -> None:
+        current = self._last_planner_failure_signatures.get()
+        self._last_planner_failure_signatures.set((*current, error.signature))
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> "VLLMHTTPModelClient":
@@ -184,36 +518,114 @@ class VLLMHTTPModelClient:
         self, *, task: str, context: dict[str, Any], mode: str
     ) -> PlannerDecision:
         self.last_planner_repairs = 0
+        self._last_planner_failure_signatures.set(())
+        try:
+            catalog = _planner_catalog(context)
+        except PlannerSemanticValidationError as error:
+            self._record_semantic_failure(error)
+            raise PlannerSemanticError(
+                str(error),
+                "caller must supply a valid role-filtered planner catalog",
+                repair_attempts=0,
+            ) from error
+        allowed_actions = sorted([*(item["name"] for item in catalog), "finalizer"])
+        task_context = {
+            key: value
+            for key, value in context.items()
+            if key != "available_tools" and not key.startswith("_")
+        }
         schema = json.dumps(PlannerDecision.model_json_schema(), sort_keys=True)
+        catalog_json = json.dumps(catalog, sort_keys=True, separators=(",", ":"))
+        valid_example = json.dumps(
+            _valid_example(catalog), sort_keys=True, separators=(",", ":")
+        )
+        invalid_example = json.dumps(
+            {
+                "objective": "Update C102.",
+                "next_action": "Run the update tool to change C102.",
+                "arguments": {"objective": "Update C102."},
+                "completed": False,
+                "user_visible_reason": "A write is needed.",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         prompt = (
             f"{mode} this business task. Return exactly one JSON object matching the schema. "
-            "Provide only a concise user-visible reason; do not include hidden reasoning.\n"
-            f"SCHEMA={schema}\nTASK={task}\nCONTEXT={json.dumps(context, sort_keys=True, default=str)}"
+            "next_action is a machine-readable identifier and MUST exactly equal one "
+            "catalog name or finalizer. Never put descriptions, verbs, explanations, or "
+            "sentences in next_action. Put explanations only in user_visible_reason. "
+            "arguments may contain only fields from the selected tool contract; never put "
+            "objective, next_action, completed, user_visible_reason, or idempotency_key in "
+            "arguments. The orchestrator supplies idempotency_key. completed=true if and "
+            "only if next_action=finalizer. Do not include hidden reasoning.\n"
+            f"ALLOWED_ACTION_IDS={json.dumps(allowed_actions)}\n"
+            f"TOOL_CATALOG={catalog_json}\nSCHEMA={schema}\n"
+            f"VALID_EXAMPLE={valid_example}\nINVALID_EXAMPLE={invalid_example}\n"
+            f"TASK={task}\n"
+            f"CONTEXT={json.dumps(task_context, sort_keys=True, default=str)}"
         )
         first = await self._chat([{"role": "user", "content": prompt}], max_tokens=700)
         try:
-            return parse_planner_decision(first)
+            return _validate_with_caller_contract(
+                parse_planner_decision(first), context
+            )
         except ValueError as first_error:
+            if isinstance(first_error, PlannerSemanticValidationError):
+                self._record_semantic_failure(first_error)
             if not self.repair_allowed:
-                raise PlannerParseError(
+                error_class = (
+                    PlannerSemanticError
+                    if isinstance(first_error, PlannerSemanticValidationError)
+                    else PlannerParseError
+                )
+                raise error_class(
                     str(first_error),
                     "run-level repair budget exhausted",
                     repair_attempts=0,
                 ) from first_error
             self.last_planner_repairs = 1
+            relevant_catalog = _relevant_contracts(first, catalog)
             repair_prompt = (
                 "Repair the following invalid planner response. Return exactly one JSON object "
-                "matching the provided schema, with no commentary. Do not invent a successful "
-                "decision when required fields are unavailable.\n"
+                "with no commentary. next_action must be exactly one allowed ID; never describe "
+                "the tool. arguments must contain only the selected contract fields. Do not "
+                "provide idempotency_key; the orchestrator supplies it. completed=true if and "
+                "only if next_action=finalizer. Do not invent missing business values.\n"
+                f"VALIDATION_ERROR={str(first_error)[:1_000]}\n"
+                f"ALLOWED_ACTION_IDS={json.dumps(allowed_actions)}\n"
+                "RELEVANT_TOOL_CONTRACTS="
+                f"{json.dumps(relevant_catalog, sort_keys=True, separators=(',', ':'))}\n"
                 f"SCHEMA={schema}\nINVALID_RESPONSE={first[:4_000]}"
             )
             try:
                 repaired = await self._chat(
                     [{"role": "user", "content": repair_prompt}], max_tokens=700
                 )
-                return parse_planner_decision(repaired)
+                return _validate_with_caller_contract(
+                    parse_planner_decision(repaired), context
+                )
             except (ValueError, httpx.HTTPError, RuntimeError) as repair_error:
-                raise PlannerParseError(str(first_error), str(repair_error)) from repair_error
+                if isinstance(repair_error, PlannerSemanticValidationError):
+                    self._record_semantic_failure(repair_error)
+                semantic_signatures = self.last_planner_failure_signatures
+                repeated_semantic_failure = (
+                    len(semantic_signatures) >= 2
+                    and semantic_signatures[-1] == semantic_signatures[-2]
+                )
+                error_class = (
+                    PlannerStuckError
+                    if repeated_semantic_failure
+                    else PlannerSemanticError
+                    if isinstance(
+                        first_error, PlannerSemanticValidationError
+                    )
+                    or isinstance(repair_error, PlannerSemanticValidationError)
+                    else PlannerParseError
+                )
+                raise error_class(
+                    str(first_error), str(repair_error)
+                ) from repair_error
 
     async def plan(
         self, task: str, context: dict[str, Any] | None = None
@@ -266,6 +678,7 @@ class FakeModelClient:
         self.memory_summary = memory_summary
         self.calls: list[str] = []
         self.last_planner_repairs = 0
+        self.last_planner_failure_signatures: list[str] = []
 
     def _fallback(
         self, task: str, state_summary: dict[str, Any] | None = None
@@ -321,9 +734,6 @@ class FakeModelClient:
             arguments = {
                 "campaign_id": campaign_id,
                 "daily_budget": amount,
-                "idempotency_key": "fake-" + hashlib.sha256(
-                    task.encode("utf-8")
-                ).hexdigest()[:20],
             }
             reason = "The requested budget change must pass policy and human review."
         elif "pause" in lowered and "pause_campaign" not in prior_tools:
@@ -331,9 +741,6 @@ class FakeModelClient:
             arguments = {
                 "campaign_id": campaign_id,
                 "reason": "Requested through the deterministic workbench client.",
-                "idempotency_key": "fake-" + hashlib.sha256(
-                    task.encode("utf-8")
-                ).hexdigest()[:20],
             }
             reason = "The campaign pause must pass policy and human review."
         elif "resume" in lowered and "resume_campaign" not in prior_tools:
@@ -341,9 +748,6 @@ class FakeModelClient:
             arguments = {
                 "campaign_id": campaign_id,
                 "reason": "Requested through the deterministic workbench client.",
-                "idempotency_key": "fake-" + hashlib.sha256(
-                    task.encode("utf-8")
-                ).hexdigest()[:20],
             }
             reason = "The campaign resume must pass policy and human review."
         else:

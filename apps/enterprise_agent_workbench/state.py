@@ -40,6 +40,7 @@ class AgentState(TypedDict, total=False):
     tool_call_count: int
     research_search_count: int
     planner_repair_count: int
+    planner_failure_signatures: list[str]
     route: str | None
     authorization_route: str | None
     errors: Annotated[list[dict[str, Any]], operator.add]
@@ -98,6 +99,7 @@ def initial_agent_state(
         "tool_call_count": 0,
         "research_search_count": 0,
         "planner_repair_count": 0,
+        "planner_failure_signatures": [],
         "route": None,
         "authorization_route": None,
         "errors": [],

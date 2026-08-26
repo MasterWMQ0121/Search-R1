@@ -189,7 +189,6 @@ async def test_api_interrupt_and_same_thread_resume(tmp_path):
                 {
                     "campaign_id": "C102",
                     "daily_budget": 1200,
-                    "idempotency_key": "api-write-0001",
                 },
             ),
             decision("finalizer", completed=True),
@@ -212,6 +211,14 @@ async def test_api_interrupt_and_same_thread_resume(tmp_path):
             assert "approval_request" in first_stream.text
             paused_state = (await client.get(f"/api/threads/{thread_id}/state")).json()
             assert paused_state["approval_request"]["action"] == "update_campaign_budget"
+            generated_key = paused_state["pending_action"]["arguments"][
+                "idempotency_key"
+            ]
+            assert generated_key.startswith("wb-")
+            assert (
+                paused_state["approval_request"]["arguments"]["idempotency_key"]
+                == generated_key
+            )
             with sqlite3.connect(service.settings.business_db_path) as connection:
                 assert connection.execute(
                     "SELECT daily_budget FROM campaigns WHERE campaign_id='C102'"
@@ -254,7 +261,6 @@ async def test_tokenizer_runtime_mismatch_rejects_approval_resume(tmp_path):
                 {
                     "campaign_id": "C102",
                     "daily_budget": 1200,
-                    "idempotency_key": "tokenizer-mismatch-write",
                 },
             )
         ],
@@ -314,7 +320,6 @@ async def test_api_rejects_approval_edit_that_changes_target(tmp_path):
                 {
                     "campaign_id": "C102",
                     "daily_budget": 1500,
-                    "idempotency_key": "api-edit-immutable",
                 },
             )
         ],
@@ -337,6 +342,10 @@ async def test_api_rejects_approval_edit_that_changes_target(tmp_path):
                 json={"task": "Increase C102 budget."},
             )
             await client.get(f"/api/threads/{thread_id}/stream")
+            paused = (await client.get(f"/api/threads/{thread_id}/state")).json()
+            generated_key = paused["pending_action"]["arguments"][
+                "idempotency_key"
+            ]
 
             response = await client.post(
                 f"/api/threads/{thread_id}/resume",
@@ -345,7 +354,7 @@ async def test_api_rejects_approval_edit_that_changes_target(tmp_path):
                     "edited_arguments": {
                         "campaign_id": "C101",
                         "daily_budget": 1200,
-                        "idempotency_key": "api-edit-immutable",
+                        "idempotency_key": generated_key,
                     },
                 },
             )
