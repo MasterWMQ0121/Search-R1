@@ -704,7 +704,8 @@ def evaluate_search_agent(example, tokenizer, generator, mode, model_path, searc
                           topk=3, max_turns=2, max_start_length=768,
                           max_response_length=128, max_obs_length=256,
                           max_prompt_length=1408, run_config=None,
-                          configure_manager=None):
+                          configure_manager=None,
+                          configure_retriever_client=None):
     import torch
     from search_r1.llm_agent.generation import GenerationConfig, LLMGenerationManager
     from verl import DataProto
@@ -741,6 +742,8 @@ def evaluate_search_agent(example, tokenizer, generator, mode, model_path, searc
     )
 
     retrieval_telemetry = {"latency_s": 0.0, "failure_count": 0}
+    if configure_retriever_client is not None:
+        configure_retriever_client(manager)
     original_batch_search = manager._batch_search
 
     def timed_batch_search(self, queries):
@@ -832,11 +835,13 @@ def evaluate_base_search(example, tokenizer, generator, model_path, search_url,
                          topk=3, max_turns=2, max_start_length=768,
                          max_response_length=128, max_obs_length=256,
                          max_prompt_length=1408, run_config=None,
-                         configure_manager=None):
+                         configure_manager=None,
+                         configure_retriever_client=None):
     return evaluate_search_agent(
         example, tokenizer, generator, "base_search", model_path, search_url,
         topk, max_turns, max_start_length, max_response_length, max_obs_length,
         max_prompt_length, run_config, configure_manager,
+        configure_retriever_client,
     )
 
 
@@ -844,11 +849,13 @@ def evaluate_search_rl(example, tokenizer, generator, model_path, search_url,
                        topk=3, max_turns=2, max_start_length=768,
                        max_response_length=128, max_obs_length=256,
                        max_prompt_length=1408, run_config=None,
-                       configure_manager=None):
+                       configure_manager=None,
+                       configure_retriever_client=None):
     return evaluate_search_agent(
         example, tokenizer, generator, "search_rl", model_path, search_url,
         topk, max_turns, max_start_length, max_response_length, max_obs_length,
         max_prompt_length, run_config, configure_manager,
+        configure_retriever_client,
     )
 
 
