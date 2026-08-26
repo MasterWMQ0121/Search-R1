@@ -1,0 +1,598 @@
+# Enterprise Agent Workbench
+
+The Enterprise Agent Workbench is an isolated application layer around the
+existing Search-R1 capabilities. It demonstrates a merchant and advertising
+operations workflow with explicit planning, structured tools, role-based
+authorization, human approval, persistent threads, citations, streaming, and
+an auditable trace.
+
+This is an enterprise workflow prototype. The campaign APIs are deterministic
+local mocks backed by SQLite; no real advertising account is connected or
+modified. The workbench does not retrain Search-R1, rebuild its Retriever
+index, or load vLLM into the FastAPI process. Model-dependent quality metrics
+require a live A800 run and are not claimed by this repository implementation.
+
+## Architecture
+
+```text
+Streamlit UI                  evaluation client
+      |                              |
+      +--------- HTTP / SSE --------+
+                     |
+                 FastAPI
+                     |
+          explicit LangGraph StateGraph
+                     |
+    +----------------+-------------------+
+    |                |                   |
+local tools     Search-R1 research   local vLLM HTTP
+KB / analytics  E5+FAISS Retriever   Qwen Phase-3 actor
+campaign mock   Phase-5 compressor   OpenAI-compatible API
+    |                |                   |
+SQLite demo DB  existing CPU server   separate GPU process
+                     |
+   SQLite checkpoints + explicit preference store + safe trace
+```
+
+LangGraph is only the orchestration layer. Search-R1 training, rollout,
+reward, evaluation, and Phase-1 through Phase-6 benchmark behavior remain
+unchanged.
+
+## Explicit graph
+
+The application uses a raw `StateGraph`, with conditional edges rather than a
+hidden high-level agent loop:
+
+```text
+START -> load_context -> planner -> policy_and_route
+                                  |-- enterprise_kb_search --|
+                                  |-- research_subgraph ------|
+                                  |-- merchant_analytics -----+-> merge_evidence
+                                  |-- campaign_read ----------|        |
+                                  |                                    v
+                                  |                                 replanner
+                                  |                                    |
+                                  +-- propose_business_write           |
+                                              |                        |
+                                     authorization_check               |
+                                      | denied        | allowed         |
+                                      v               v                 |
+                               merge_evidence   human approval interrupt
+                                                        |
+                                                approve/edit/reject
+                                                        |
+                                             execute or return safely
+
+policy_and_route -> finalizer -> citation_validation -> END
+```
+
+Maximum graph steps, tool calls, research searches, planner repairs, and
+per-tool timeouts are configuration limits. A run cannot use an unbounded
+Python loop. The planner stores only a concise `user_visible_reason`; hidden
+chain-of-thought is neither requested nor retained.
+
+## State contract
+
+`AgentState` contains primitive, checkpoint-safe values:
+
+- Identity: `thread_id`, `run_id`, `user_id`, `organization_id`, `role`.
+- Request/context: `task`, `messages`, `conversation_summary`,
+  `user_preferences`.
+- Planning: `plan`, `next_action`, `action_arguments`, `pending_action`.
+- Evidence: `tool_results`, `sources`.
+- Control: `approval_request`, `approval_decision`, `step_count`,
+  `tool_call_count`, `research_search_count`, `planner_repair_count`, `route`,
+  `authorization_route`.
+- Outcome: `errors`, `final_answer`, `final_citations`, `completed`,
+  `termination_reason`, `citation_coverage`.
+- Audit: `execution_trace`.
+
+Reducers are used only for append-only messages, tool results, sources, trace
+events, and errors. Replacement fields do not accidentally duplicate when a
+checkpointed node is replayed.
+
+Default safety limits are 40 graph steps, eight tool calls, two research
+searches, one planner repair, a 20-second outer tool timeout, and conversation
+summarization after 12 messages. They can be tightened with the corresponding
+`WORKBENCH_MAX_GRAPH_STEPS`, `WORKBENCH_MAX_TOOL_CALLS`,
+`WORKBENCH_MAX_RESEARCH_SEARCHES`, `WORKBENCH_MAX_PLANNER_REPAIRS`,
+`WORKBENCH_TOOL_TIMEOUT_SECONDS`, and
+`WORKBENCH_SUMMARY_MESSAGE_THRESHOLD` environment variables. Registry entries
+also enforce their own lower per-tool timeouts.
+
+## Model boundary
+
+`WorkbenchModelClient` defines asynchronous `plan`, `replan`, `synthesize`,
+and `summarize_memory` operations. Production uses
+`VLLMHTTPModelClient`; CPU tests use the deterministic `FakeModelClient`.
+
+Planner output is Pydantic-validated JSON containing an objective, one next
+action, arguments, a completed flag, and a user-visible reason. The client
+extracts one JSON object, validates it, performs at most one deterministic
+repair request, and raises `planner_parse_error` if repair also fails. It never
+fabricates a successful tool choice.
+
+Configure the separate model endpoint with:
+
+```bash
+export WORKBENCH_LLM_BASE_URL=http://127.0.0.1:8001/v1
+export WORKBENCH_MODEL_NAME=phase3-search-r1
+```
+
+## Tool Registry
+
+Every tool has an explicit Pydantic input and output model, category, risk,
+roles, timeout, read/write designation, approval flag, idempotency declaration,
+source-production flag, and enabled state. `GET /api/tools` returns only safe
+metadata.
+
+| Category | Tools | Side effect |
+|---|---|---|
+| `knowledge` | `enterprise_kb_search` | None |
+| `research` | `research_search` | One traced Retriever request |
+| `analytics` | `campaign_performance_summary`, `compare_periods`, `channel_breakdown`, `conversion_funnel`, `roi_anomaly_detection`, `campaign_current_state` | Read-only parameterized SQL |
+| `business_read` | `get_campaign`, `list_campaigns`, `get_budget_policy_status` | Read-only |
+| `business_write` | `update_campaign_budget`, `pause_campaign`, `resume_campaign`, `create_followup_task` | Local SQLite write after approval |
+
+The model never executes arbitrary SQL and cannot discover an unregistered
+function.
+
+## RBAC policy
+
+| Role | Knowledge/research | Business reads | Analytics | Propose writes | Execute after approval |
+|---|---:|---:|---:|---:|---:|
+| viewer | yes | yes | no | no | no |
+| analyst | yes | yes | yes | no | no |
+| operator | yes | yes | yes | yes | yes |
+| admin | yes | yes | yes | yes | yes |
+
+All registered writes remain approval-required for operator and admin. Policy
+also checks that the tool exists, is enabled, the run remains within budget,
+and a side-effecting action carries an idempotency key. A denied tool never
+executes; denial becomes both a user-visible response and a structured audit
+event that the planner can use safely.
+
+## Human approval lifecycle
+
+1. The planner proposes a side-effecting tool and arguments.
+2. Policy validates role, risk, budgets, schema, and idempotency key.
+3. The graph includes current campaign state in the approval card when an
+   earlier read made it available; the transactional API always records the
+   authoritative before state at execution.
+4. `interrupt()` returns a JSON-safe payload with action, arguments, reason,
+   risk, requester, role, prior state, and allowed decisions.
+5. No business write or premature audit write occurs before the interrupt.
+6. Resume uses the same thread ID:
+   - **approve** executes the original validated arguments;
+   - **edit** validates the replacement JSON and executes only the edited
+     arguments;
+   - **reject** performs no write and records reviewer feedback.
+7. The transactional business API records before/after state and an audit row.
+   A unique idempotency key prevents double execution if resume replays.
+
+## Search-R1 research integration
+
+The research tool sends exactly one HTTP request represented by its trace
+event to the configured existing Retriever:
+
+```json
+{"queries":["generated query"],"topk":3,"return_scores":true}
+```
+
+It validates the one-query result group and passes the scored nested passages
+to `experiments/phase5_observation_context/evidence_compressor.py` through
+`Phase5EvidenceAdapter`. The compressor is imported, not copied. It uses the
+generated query only—never an answer or ground truth—and bounds the complete
+Search-R1 information wrapper to the configured token budget (default 256).
+The subgraph returns compressed evidence, source metadata, Retriever timing,
+compression timing, and an explicit failure status.
+
+Live mode requires `WORKBENCH_TOKENIZER_PATH` to name a local checkpoint
+directory containing the exact Qwen tokenizer artifacts. It loads only the
+tokenizer on CPU with local-files-only behavior and injects it through
+`build_default_service` into the existing Phase-5 compressor; model weights are
+not loaded in the Workbench process. Startup also verifies that the loaded
+implementation is a Qwen2 tokenizer rather than labeling an arbitrary local
+tokenizer as exact. Missing artifacts, an invalid path, a different tokenizer
+family, or a load failure stops startup. The reversible lexical tokenizer is
+available only when tests or local development explicitly set
+`WORKBENCH_ALLOW_APPROX_TOKENIZER=true`; there is no silent live fallback.
+
+`GET /healthz` reports the safe tokenizer mode, sanitized configured path,
+tokenizer class, artifact fingerprint, compressor policy/version and
+fingerprint, and maximum evidence-token budget. Evaluation fingerprints bind
+these values together with model and Retriever configuration, so a partial run
+cannot resume under a different token-accounting contract. The Retriever
+remains a separate CPU service and vLLM remains a separate GPU service.
+
+## Enterprise knowledge and merchant data
+
+The enterprise fixture documents are searched by a deterministic BM25-like
+lexical index; no new embedding model is required. Returned snippets are
+bounded and carry stable IDs such as `KB-POLICY-001`.
+
+`scripts/initialize_demo_data.py` creates deterministic local tables for
+campaign state, daily metrics, orders, business audit events, and idempotency
+records. Analytics operations use parameterized SQL and return derived metrics,
+query identifiers, source identifiers, and measured latency. Business writes
+are transactional and affect only this local database.
+
+## Memory
+
+Short-term state uses the LangGraph SQLite checkpointer keyed by `thread_id`.
+It retains checkpoint-safe messages, plans, tool results, approval state,
+trace, and final output so the exact thread can resume.
+
+Long-term memory is a separate SQLite preference store namespaced by
+`organization_id` and `user_id`. Only explicit allowlisted preferences are
+accepted, such as reporting format, date range, KPI, and default merchant ID.
+Credentials, access tokens, raw database rows, unrestricted tool output, and
+hidden reasoning are rejected. Starting a new thread does not delete explicit
+preferences; the API supports inspect, update, and delete operations.
+
+When message count exceeds the configured threshold, the graph asks the model
+client for a concise conversation summary. Original business evidence remains
+in structured tool/source records rather than being copied into long-term
+preference memory.
+
+Set `LANGGRAPH_STRICT_MSGPACK=true` whenever SQLite checkpointing is used.
+
+## Citations
+
+Knowledge, research, analytics, and business-read tools return stable source
+records. Final answers cite their IDs in markers such as `[KB-POLICY-001]`.
+Citation validation rejects unknown IDs and the API returns sources separately
+from answer text. Public projections omit internal paths and bound snippets.
+
+Citation coverage is a deterministic lexical approximation:
+
+```text
+evidence-looking paragraphs or bullets containing citations
+------------------------------------------------------------
+all evidence-looking paragraphs or bullets
+```
+
+It measures marker coverage, not whether evidence semantically proves a claim.
+
+## Trace and streaming
+
+Trace events include `run_started`, node start/completion, planner decisions and
+repairs, policy decisions, tool start/completion/failure, approval outcomes,
+final answer creation, and run completion/failure. Events carry sequence,
+timestamp, thread/run IDs, node/tool, non-negative duration, status, bounded
+safe summaries, error type, and retry number.
+
+Secret-looking fields, bearer credentials, and hidden-reasoning keys are
+redacted or removed. Machine-readable JSON and a human-readable timeline are
+available through the API. SSE streams graph progress without exposing model
+reasoning tokens.
+
+## HTTP API
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/healthz` | Readiness and safe configuration summary |
+| GET | `/api/tools` | Safe Tool Registry metadata |
+| POST | `/api/threads` | Create an identity-bound thread |
+| POST | `/api/threads/{thread_id}/runs` | Start a business task |
+| GET | `/api/threads/{thread_id}/stream` | Stream progress using SSE |
+| GET | `/api/threads/{thread_id}/state` | Latest safe state projection |
+| GET | `/api/threads/{thread_id}/history` | Checkpoint/node history |
+| GET | `/api/threads/{thread_id}/trace` | Safe machine-readable trace |
+| POST | `/api/threads/{thread_id}/resume` | Approve, edit, or reject |
+| GET | `/api/users/{user_id}/memories` | Inspect explicit preferences |
+| PUT | `/api/users/{user_id}/memories/{key}` | Add/update an allowlisted preference |
+| DELETE | `/api/users/{user_id}/memories/{key}` | Delete one preference |
+
+Pydantic request/response schemas form the service boundary. Raw LangGraph
+state and implementation objects are never returned.
+
+## Streamlit workflow
+
+The left panel selects user, organization, role, and thread. The main panel
+accepts a task and shows final answer, citations, sources, and tool results. The
+right panel shows the current plan, timeline, tool calls, latency, errors, and
+an approval card with approve, reject, and validated JSON-edit controls.
+Additional tabs show conversation memory, audit trace, and registry metadata.
+The UI consumes only safe FastAPI responses.
+
+## Isolated environment
+
+Use Python 3.10 or newer. Do not install these dependencies into macOS base
+Python, the Search-R1 Conda environment, or `.venv-phase1`.
+
+```bash
+cd /Users/wangmingqi/Documents/search_rl
+WORKBENCH_PYTHON="${WORKBENCH_PYTHON:-python3}"
+command -v "${WORKBENCH_PYTHON}"
+"${WORKBENCH_PYTHON}" --version
+"${WORKBENCH_PYTHON}" -c \
+  'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"'
+"${WORKBENCH_PYTHON}" -m venv .venv-workbench
+export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
+"${WORKBENCH_PYTHON}" -m pip install --upgrade pip
+"${WORKBENCH_PYTHON}" -m pip install \
+  -r apps/enterprise_agent_workbench/requirements-workbench.txt
+export PYTHONPATH=/Users/wangmingqi/Documents/search_rl
+export LANGGRAPH_STRICT_MSGPACK=true
+```
+
+The pinned top-level requirements publish `Requires-Python` metadata compatible
+with Python 3.10: the strictest pins require Python 3.10, while the remaining
+pins require Python 3.9 or earlier. Python 3.10 and 3.11 are therefore supported;
+the launch scripts print the resolved interpreter and version and reject Python
+3.9. No package installation is performed by the repository scripts.
+
+## Local CPU startup
+
+Initialize the deterministic fixtures once:
+
+```bash
+cd /Users/wangmingqi/Documents/search_rl
+export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
+export WORKBENCH_DATA_DIR=/Users/wangmingqi/.search_r1_workbench
+"${WORKBENCH_PYTHON}" \
+  apps/enterprise_agent_workbench/scripts/initialize_demo_data.py
+```
+
+With model and Retriever endpoints available, start the backend and UI in
+separate terminals:
+
+```bash
+cd /Users/wangmingqi/Documents/search_rl
+export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
+export WORKBENCH_LLM_BASE_URL=http://127.0.0.1:8001/v1
+export WORKBENCH_MODEL_NAME=phase3-search-r1
+export WORKBENCH_RETRIEVER_URL=http://127.0.0.1:8000/retrieve
+export WORKBENCH_ALLOW_APPROX_TOKENIZER=true
+bash apps/enterprise_agent_workbench/scripts/run_api.sh
+```
+
+```bash
+cd /Users/wangmingqi/Documents/search_rl
+export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
+export WORKBENCH_API_BASE_URL=http://127.0.0.1:8010
+bash apps/enterprise_agent_workbench/scripts/run_ui.sh
+```
+
+Open `http://127.0.0.1:8501`.
+
+## A800 service startup
+
+The commands below keep Retriever, model server, orchestration API, and UI in
+four separate processes. Adjust only local asset paths to the audited A800
+layout.
+
+### 1. Existing CPU Retriever
+
+```bash
+cd /workspace/Search-R1
+export PYTHONPATH=/workspace/Search-R1
+export CUDA_VISIBLE_DEVICES=
+python -m experiments.phase6_retriever_serving.optimized_retrieval_server \
+  --index-path /workspace/searchr1-assets/wiki18/e5_Flat.index \
+  --corpus-path /workspace/searchr1-assets/wiki18/wiki-18.jsonl \
+  --model-path /workspace/searchr1-assets/models/e5-base-v2 \
+  --index-backend flat \
+  --faiss-thread-count 8 \
+  --retrieval-encode-batch-size 32 \
+  --top-k 3 \
+  --cache-disabled \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+### 2. Trained Qwen vLLM server
+
+Use the existing GPU environment containing vLLM 0.6.3:
+
+```bash
+cd /workspace/Search-R1
+export CUDA_VISIBLE_DEVICES=0
+export VLLM_ATTENTION_BACKEND=XFORMERS
+python -m vllm.entrypoints.openai.api_server \
+  --model /workspace/Search-R1/verl_checkpoints/phase3-qwen2.5-3b-small-real-grpo-training/actor/global_step_20 \
+  --served-model-name phase3-search-r1 \
+  --host 127.0.0.1 \
+  --port 8001 \
+  --dtype bfloat16 \
+  --tensor-parallel-size 1 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.20
+```
+
+The workbench does not assume that 0.20 is an optimal serving value; it keeps
+the previously conservative Search-R1 setting for initial validation. The
+8192-token model context is intentionally larger than the planner and
+synthesis output caps because their inputs include bounded Tool Registry
+schemas and evidence. Do not reduce it to 2048 without measuring the complete
+rendered requests.
+
+### 3. LangGraph/FastAPI backend
+
+```bash
+cd /workspace/Search-R1
+WORKBENCH_PYTHON="${WORKBENCH_PYTHON:-python3}"
+command -v "${WORKBENCH_PYTHON}"
+"${WORKBENCH_PYTHON}" --version
+"${WORKBENCH_PYTHON}" -c \
+  'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"'
+"${WORKBENCH_PYTHON}" -m venv .venv-workbench
+export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
+"${WORKBENCH_PYTHON}" -m pip install \
+  -r apps/enterprise_agent_workbench/requirements-workbench.txt
+export WORKBENCH_EVAL_RUN_ID="$(git rev-parse HEAD)-phase3-global_step_20-flat-wiki18-topk3-evidence256-merchant-seed-v1-run-001"
+export WORKBENCH_DATA_DIR="/workspace/search_r1_workbench_evaluations/${WORKBENCH_EVAL_RUN_ID}"
+if [ -e "$WORKBENCH_DATA_DIR" ]; then
+  echo "Choose a new run identity and empty data directory"
+  exit 1
+fi
+"${WORKBENCH_PYTHON}" \
+  apps/enterprise_agent_workbench/scripts/initialize_demo_data.py \
+  --overwrite
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export WORKBENCH_TOKENIZER_PATH=/workspace/Search-R1/verl_checkpoints/phase3-qwen2.5-3b-small-real-grpo-training/actor/global_step_20
+export WORKBENCH_LLM_BASE_URL=http://127.0.0.1:8001/v1
+export WORKBENCH_MODEL_NAME=phase3-search-r1
+export WORKBENCH_RETRIEVER_URL=http://127.0.0.1:8000/retrieve
+"${WORKBENCH_PYTHON}" -m apps.enterprise_agent_workbench.tokenizer_preflight
+bash apps/enterprise_agent_workbench/scripts/run_api.sh
+```
+
+The preflight prints only the tokenizer class, vocabulary size, pad/eos token
+IDs, artifact fingerprint, and an exact-tokenizer-mode PASS marker. It does not
+list tokenizer files or inspect model weights. `run_api.sh` repeats the same
+fail-closed preflight before starting Uvicorn. On a network-isolated host,
+prepare the venv from an audited local wheelhouse using pip's `--no-index` and
+`--find-links` options; never install these packages into base Anaconda, the
+Search-R1 Conda environment, or `.venv-phase1`.
+
+Every new live evaluation must use a new run identity and a newly seeded,
+dedicated `WORKBENCH_DATA_DIR`. The identity must encode the app revision,
+model checkpoint, Retriever/index settings, relevant runtime overrides, seed,
+and a unique run suffix. This prevents campaign writes from one evaluation
+from contaminating another. For a continuation of an interrupted evaluation,
+reuse both the exact identity and its unchanged data directory; do not reseed.
+
+### 4. Streamlit
+
+```bash
+cd /workspace/Search-R1
+export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
+export WORKBENCH_API_BASE_URL=http://127.0.0.1:8010
+bash apps/enterprise_agent_workbench/scripts/run_ui.sh
+```
+
+Shell exports are terminal-local. The UI terminal must repeat its
+`WORKBENCH_PYTHON` and API URL exports as shown; it does not inherit the API
+terminal's environment. It does not need the tokenizer path because the UI is
+an HTTP client of the already validated API.
+
+### 5. End-to-end evaluation
+
+This command records live model-dependent results; it has no fake-success mode:
+
+```bash
+cd /workspace/Search-R1
+export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
+export PYTHONPATH=/workspace/Search-R1
+export WORKBENCH_EVAL_RUN_ID="$(git rev-parse HEAD)-phase3-global_step_20-flat-wiki18-topk3-evidence256-merchant-seed-v1-run-001"
+export WORKBENCH_DATA_DIR="/workspace/search_r1_workbench_evaluations/${WORKBENCH_EVAL_RUN_ID}"
+"${WORKBENCH_PYTHON}" -m \
+  apps.enterprise_agent_workbench.evaluation.run_evaluation \
+  --api-base-url http://127.0.0.1:8010 \
+  --run-config-identity "$WORKBENCH_EVAL_RUN_ID" \
+  --fresh-isolated-database-confirmed \
+  --output "${WORKBENCH_DATA_DIR}/evaluation/results.jsonl" \
+  --overwrite
+
+"${WORKBENCH_PYTHON}" -m \
+  apps.enterprise_agent_workbench.evaluation.summarize_evaluation \
+  --results "${WORKBENCH_DATA_DIR}/evaluation/results.jsonl" \
+  --output-json "${WORKBENCH_DATA_DIR}/evaluation/summary.json" \
+  --output-markdown "${WORKBENCH_DATA_DIR}/evaluation/summary.md"
+```
+
+The evaluation terminal must repeat `WORKBENCH_PYTHON`, `PYTHONPATH`, the exact
+`WORKBENCH_EVAL_RUN_ID`, and its derived `WORKBENCH_DATA_DIR`; exports from the
+API terminal are not shared. The evaluator obtains model, Retriever,
+tokenizer, and compressor identity from the API's safe health metadata and
+binds it into the resume fingerprint.
+
+`--overwrite` replaces only the measured JSONL output; it does not reset the
+SQLite campaign database. Never use it to rerun against a database already
+mutated by another completed evaluation. Resume a partial result by omitting
+`--overwrite` and retaining the same isolated database and run identity.
+
+## Demo scenarios
+
+The UI supports deterministic demonstrations of knowledge-only policy search,
+C102 ROI comparison, mixed data-and-policy diagnosis, campaign reads, approved
+budget update, rejected update, viewer denial, reviewer-edited update, explicit
+preference memory, and traced tool failure recovery.
+
+The example budget workflow is:
+
+> Analyze why Campaign C102's ROI declined during the last seven days, check
+> the relevant budget policy, recommend corrective actions, and increase the
+> daily budget to 1200 if the change is compliant.
+
+An operator run should pause before the local write. The database changes only
+after an explicit approve or valid edit decision.
+
+## Evaluation methodology
+
+`evaluation/cases.jsonl` contains exactly 24 cases:
+
+- 6 knowledge-only;
+- 6 analytics-only;
+- 6 mixed read-only;
+- 6 write/approval/permission.
+
+Cases declare expected tool categories, prohibited tools, approval and policy
+behavior, source types, state deltas, and minimal acceptable facts. They do not
+contain hidden answers, Retriever ground truth, or reward labels.
+
+The live evaluator reports run completion, assertion-backed task completion,
+routing, prohibited execution,
+permission interception, approval/resume, idempotency, citation validity and
+coverage, expected local database-state deltas, failure recovery, latency, tool
+calls, planner repairs, and unfinished runs. Run completion means that the graph
+finished with a nonempty answer and no recorded error; it is not itself a
+semantic task-success claim. Task completion additionally requires every
+applicable case assertion (facts, routing, source types, citations, policy,
+approval, idempotency, and state delta) to pass. Fingerprints bind the case-file hash, API URL,
+caller-supplied immutable run identity, and public server health/Tool Registry
+metadata, so incompatible partial results are rejected. Generated
+artifacts default to `~/.search_r1_workbench/evaluation` and are rejected if directed
+inside Phase-4 or Phase-5 result directories.
+
+Deterministic infrastructure and policy correctness belongs to the CPU test
+suite. Model routing, synthesis, and answer quality belong to the live A800
+evaluation. The summary never substitutes test-fixture outcomes for measured
+model performance.
+
+## Tests
+
+Use the isolated workbench environment for application tests; no model download
+or GPU is required:
+
+```bash
+cd /Users/wangmingqi/Documents/search_rl
+PYTHONPATH=. ./.venv-workbench/bin/python -m pytest -q \
+  tests/enterprise_workbench
+```
+
+Run existing Phase tests separately with `.venv-phase1`; the workbench never
+installs LangGraph into that environment. Shell scripts are syntax-checkable
+with:
+
+```bash
+bash -n apps/enterprise_agent_workbench/scripts/run_api.sh
+bash -n apps/enterprise_agent_workbench/scripts/run_ui.sh
+```
+
+## Current limitations and production hardening
+
+- Fixture data and business APIs are local deterministic mocks, not production
+  integrations.
+- The SQLite stores are suitable for a single-node demonstration; production
+  needs managed transactional storage, migrations, backup, encryption, and
+  concurrency/load testing.
+- In-process run coordination and SSE need a durable queue/pub-sub layer for
+  multiple API workers.
+- Authentication, SSO, tenant provisioning, key management, and network policy
+  are outside this prototype. Caller-supplied IDs are not production identity.
+- Policy rules are code-backed examples and need enterprise governance,
+  versioning, and independent authorization review.
+- Retrieved open-domain evidence can be stale or misleading. Compression is
+  lexical and citation presence does not prove support.
+- Approximate lexical token accounting is intentionally restricted to explicit
+  test/development mode. Live startup requires the local Qwen tokenizer and
+  fails closed if its exact-tokenizer preflight cannot pass.
+- The 24-case suite is a smoke evaluation, not a business-quality benchmark.
+- Model-dependent quality, latency, and recovery results remain unmeasured until
+  the documented A800 evaluation is run.
+- Production writes require external idempotency, reconciliation, compensating
+  actions, approval expiry, and tamper-evident audit retention.

@@ -1,0 +1,54 @@
+{
+  "campaigns": [
+    {
+      "campaign_id": "C101",
+      "name": "Brand Awareness",
+      "status": "active",
+      "daily_budget": 800.0,
+      "owner": "merchant-ops",
+      "updated_at": "2026-08-14T00:00:00+00:00"
+    },
+    {
+      "campaign_id": "C102",
+      "name": "Summer Conversion",
+      "status": "active",
+      "daily_budget": 1000.0,
+      "owner": "advertising-ops",
+      "updated_at": "2026-08-14T00:00:00+00:00"
+    }
+  ],
+  "campaign_daily_metrics": [
+    {"date": "2026-08-01", "campaign_id": "C102", "channel": "search", "spend": 100.0, "impressions": 10000, "clicks": 500, "conversions": 50, "revenue": 250.0},
+    {"date": "2026-08-02", "campaign_id": "C102", "channel": "social", "spend": 100.0, "impressions": 11000, "clicks": 520, "conversions": 51, "revenue": 255.0},
+    {"date": "2026-08-03", "campaign_id": "C102", "channel": "search", "spend": 100.0, "impressions": 10200, "clicks": 505, "conversions": 50, "revenue": 250.0},
+    {"date": "2026-08-04", "campaign_id": "C102", "channel": "social", "spend": 100.0, "impressions": 10800, "clicks": 510, "conversions": 49, "revenue": 245.0},
+    {"date": "2026-08-05", "campaign_id": "C102", "channel": "search", "spend": 100.0, "impressions": 10100, "clicks": 500, "conversions": 50, "revenue": 250.0},
+    {"date": "2026-08-06", "campaign_id": "C102", "channel": "social", "spend": 100.0, "impressions": 11200, "clicks": 525, "conversions": 52, "revenue": 260.0},
+    {"date": "2026-08-07", "campaign_id": "C102", "channel": "search", "spend": 100.0, "impressions": 10300, "clicks": 510, "conversions": 50, "revenue": 250.0},
+    {"date": "2026-08-08", "campaign_id": "C102", "channel": "social", "spend": 120.0, "impressions": 12500, "clicks": 500, "conversions": 34, "revenue": 170.0},
+    {"date": "2026-08-09", "campaign_id": "C102", "channel": "search", "spend": 120.0, "impressions": 12000, "clicks": 495, "conversions": 35, "revenue": 175.0},
+    {"date": "2026-08-10", "campaign_id": "C102", "channel": "social", "spend": 120.0, "impressions": 12800, "clicks": 505, "conversions": 36, "revenue": 180.0},
+    {"date": "2026-08-11", "campaign_id": "C102", "channel": "search", "spend": 120.0, "impressions": 12200, "clicks": 490, "conversions": 34, "revenue": 170.0},
+    {"date": "2026-08-12", "campaign_id": "C102", "channel": "social", "spend": 120.0, "impressions": 13000, "clicks": 510, "conversions": 36, "revenue": 180.0},
+    {"date": "2026-08-13", "campaign_id": "C102", "channel": "search", "spend": 120.0, "impressions": 12100, "clicks": 485, "conversions": 33, "revenue": 165.0},
+    {"date": "2026-08-14", "campaign_id": "C102", "channel": "social", "spend": 120.0, "impressions": 13200, "clicks": 515, "conversions": 37, "revenue": 185.0},
+    {"date": "2026-08-14", "campaign_id": "C101", "channel": "search", "spend": 80.0, "impressions": 9000, "clicks": 450, "conversions": 42, "revenue": 210.0}
+  ],
+  "orders": [
+    {"date": "2026-08-01", "campaign_id": "C102", "order_count": 50, "gross_revenue": 250.0, "refund_amount": 5.0},
+    {"date": "2026-08-02", "campaign_id": "C102", "order_count": 51, "gross_revenue": 255.0, "refund_amount": 5.0},
+    {"date": "2026-08-03", "campaign_id": "C102", "order_count": 50, "gross_revenue": 250.0, "refund_amount": 4.0},
+    {"date": "2026-08-04", "campaign_id": "C102", "order_count": 49, "gross_revenue": 245.0, "refund_amount": 5.0},
+    {"date": "2026-08-05", "campaign_id": "C102", "order_count": 50, "gross_revenue": 250.0, "refund_amount": 4.0},
+    {"date": "2026-08-06", "campaign_id": "C102", "order_count": 52, "gross_revenue": 260.0, "refund_amount": 6.0},
+    {"date": "2026-08-07", "campaign_id": "C102", "order_count": 50, "gross_revenue": 250.0, "refund_amount": 5.0},
+    {"date": "2026-08-08", "campaign_id": "C102", "order_count": 34, "gross_revenue": 170.0, "refund_amount": 12.0},
+    {"date": "2026-08-09", "campaign_id": "C102", "order_count": 35, "gross_revenue": 175.0, "refund_amount": 13.0},
+    {"date": "2026-08-10", "campaign_id": "C102", "order_count": 36, "gross_revenue": 180.0, "refund_amount": 14.0},
+    {"date": "2026-08-11", "campaign_id": "C102", "order_count": 34, "gross_revenue": 170.0, "refund_amount": 13.0},
+    {"date": "2026-08-12", "campaign_id": "C102", "order_count": 36, "gross_revenue": 180.0, "refund_amount": 15.0},
+    {"date": "2026-08-13", "campaign_id": "C102", "order_count": 33, "gross_revenue": 165.0, "refund_amount": 14.0},
+    {"date": "2026-08-14", "campaign_id": "C102", "order_count": 37, "gross_revenue": 185.0, "refund_amount": 15.0},
+    {"date": "2026-08-14", "campaign_id": "C101", "order_count": 42, "gross_revenue": 210.0, "refund_amount": 3.0}
+  ]
+}
