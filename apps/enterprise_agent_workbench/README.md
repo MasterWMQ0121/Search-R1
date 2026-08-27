@@ -38,6 +38,20 @@ LangGraph is only the orchestration layer. Search-R1 training, rollout,
 reward, evaluation, and Phase-1 through Phase-6 benchmark behavior remain
 unchanged.
 
+The runtime separates an LLM data plane from a deterministic Agent control
+plane:
+
+- The **LLM data plane** interprets the task, proposes plans and replans, and
+  synthesizes the final answer.
+- The **deterministic Agent control plane** enforces canonical Tool IDs,
+  Pydantic argument validation, role-aware Tool visibility, idempotency-key
+  generation, PolicyEngine/RBAC decisions, side-effect detection, human
+  approval, transactional write execution, audit logging, loop guards,
+  checkpoint/resume, and citation validation.
+
+The model proposes actions. The deterministic control plane authorizes and
+executes them; security guarantees do not come from the LLM.
+
 ## Explicit graph
 
 The application uses a raw `StateGraph`, with conditional edges rather than a
@@ -120,6 +134,53 @@ Configure the separate model endpoint with:
 export WORKBENCH_LLM_BASE_URL=http://127.0.0.1:8001/v1
 export WORKBENCH_MODEL_NAME=phase3-search-r1
 ```
+
+### Planner context optimization
+
+The full Tool Registry schema exceeded the 8K deployment context before the
+role-aware compact Planner catalog was introduced. These are measured prompt
+construction results for the operator task `Increase C102 daily budget to
+1200.`:
+
+| Metric | Full Registry | Compact Planner | Change |
+|---|---:|---:|---:|
+| Catalog characters | 32,824 | 5,369 | -83.64% |
+| Planner prompt characters | 33,897 | 7,647 | -77.44% |
+| Planner prompt tokens | 9,698 | 1,790 | -81.54% |
+
+Measured with the exact `Qwen2TokenizerFast` from the deployed checkpoint,
+whose tokenizer-artifact fingerprint was
+`7bdc8e14fc92822acfae6c899872a6d1ca27492d4017ac66b98bd26811c66f12`.
+For the initial Planner request, the 8,192-token context minus the measured
+1,790-token prompt, 700-token output reservation, and 256-token safety margin
+leaves 5,446 tokens of headroom. Thus the measured initial Planner request is
+safe for this 8,192-token deployment contract:
+
+```text
+8,192 - 1,790 - 700 - 256 = 5,446
+safe_for_8192_initial_planner = true
+```
+
+The 1,790-token figure is specifically the initial Planner measurement.
+Replanner requests can additionally include bounded prior tool results and
+must not be described as always having that exact token count.
+These measurements characterize prompt construction, not answer quality, EM,
+latency, or production readiness. Business-state demonstrations continue to
+use deterministic local SQLite fixtures.
+
+### Engineering lessons
+
+1. The full Registry schema produced a 9,698-token Planner prompt and overflowed
+   the 8K context. A role-aware compact Planner catalog removed that overflow.
+2. Free-form `next_action` values let descriptive strings such as `Run the
+   structured merchant analytics operation update_campaign_budget...` reach
+   policy and repeat as `unknown_tool`. Canonical IDs, semantic repair, and loop
+   guards now stop that path safely.
+3. This Workbench's async HITL path under Python 3.10 raised `Called get_config
+   outside of a runnable context`. The validated deployment uses Python 3.11+
+   for reliable interrupt/resume context propagation.
+4. Long-context diagnosis exposed mismatched vLLM CUDA-graph capture limits.
+   This deployment keeps `max_model_len` and `max_seq_len_to_capture` aligned.
 
 ## Tool Registry
 
@@ -303,8 +364,11 @@ The UI consumes only safe FastAPI responses.
 
 ## Isolated environment
 
-Use Python 3.10 or newer. Do not install these dependencies into macOS base
-Python, the Search-R1 Conda environment, or `.venv-phase1`.
+Use Python 3.11 or newer. This requirement is scoped to reliable async
+LangGraph interrupt/resume context propagation in this Workbench HITL
+deployment; it is not a claim that every LangGraph use case requires Python
+3.11. Do not install these dependencies into macOS base Python, the Search-R1
+Conda environment, or `.venv-phase1`.
 
 ```bash
 cd /Users/wangmingqi/Documents/search_rl
@@ -312,7 +376,7 @@ WORKBENCH_PYTHON="${WORKBENCH_PYTHON:-python3}"
 command -v "${WORKBENCH_PYTHON}"
 "${WORKBENCH_PYTHON}" --version
 "${WORKBENCH_PYTHON}" -c \
-  'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"'
+  'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is required"'
 "${WORKBENCH_PYTHON}" -m venv .venv-workbench
 export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
 "${WORKBENCH_PYTHON}" -m pip install --upgrade pip
@@ -322,11 +386,13 @@ export PYTHONPATH=/Users/wangmingqi/Documents/search_rl
 export LANGGRAPH_STRICT_MSGPACK=true
 ```
 
-The pinned top-level requirements publish `Requires-Python` metadata compatible
-with Python 3.10: the strictest pins require Python 3.10, while the remaining
-pins require Python 3.9 or earlier. Python 3.10 and 3.11 are therefore supported;
-the launch scripts print the resolved interpreter and version and reject Python
-3.9. No package installation is performed by the repository scripts.
+Some pinned dependencies publish `Requires-Python` metadata that is compatible
+with older interpreters, but the operational Workbench contract is stricter:
+Python 3.10 fails before launch, while Python 3.11 and later pass the startup
+check where the installed dependency set supports them. The launch scripts use
+`WORKBENCH_PYTHON` rather than requiring a version-specific executable; they
+print the resolved interpreter and version. No package installation is
+performed by the repository scripts.
 
 ## Local CPU startup
 
@@ -395,6 +461,8 @@ Use the existing GPU environment containing vLLM 0.6.3:
 cd /workspace/Search-R1
 export CUDA_VISIBLE_DEVICES=0
 export VLLM_ATTENTION_BACKEND=XFORMERS
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 python -m vllm.entrypoints.openai.api_server \
   --model /workspace/Search-R1/verl_checkpoints/phase3-qwen2.5-3b-small-real-grpo-training/actor/global_step_20 \
   --served-model-name phase3-search-r1 \
@@ -403,15 +471,20 @@ python -m vllm.entrypoints.openai.api_server \
   --dtype bfloat16 \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \
-  --gpu-memory-utilization 0.20
+  --max-seq-len-to-capture 8192 \
+  --gpu-memory-utilization 0.35 \
+  --guided-decoding-backend lm-format-enforcer
 ```
 
-The workbench does not assume that 0.20 is an optimal serving value; it keeps
-the previously conservative Search-R1 setting for initial validation. The
-8192-token model context is intentionally larger than the planner and
-synthesis output caps because their inputs include bounded Tool Registry
-schemas and evidence. Do not reduce it to 2048 without measuring the complete
-rendered requests.
+The trained Phase-3 checkpoint is loaded from local disk with the XFormers
+backend and offline Hugging Face/Transformers behavior. The compact Planner
+catalog removed the original full-Registry 8K overflow, so a larger context is
+not needed for that failure. For this vLLM deployment, the 8,192-token model
+context and CUDA-graph capture boundary are explicitly aligned, and
+`lm-format-enforcer` is used to avoid the incompatible Outlines path observed
+in this environment. These settings are the final validated deployment
+contract, not a general performance recommendation for other vLLM versions or
+models. Do not substitute Outlines for this deployment.
 
 ### 3. LangGraph/FastAPI backend
 
@@ -421,7 +494,7 @@ WORKBENCH_PYTHON="${WORKBENCH_PYTHON:-python3}"
 command -v "${WORKBENCH_PYTHON}"
 "${WORKBENCH_PYTHON}" --version
 "${WORKBENCH_PYTHON}" -c \
-  'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ is required"'
+  'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is required"'
 "${WORKBENCH_PYTHON}" -m venv .venv-workbench
 export WORKBENCH_PYTHON="$PWD/.venv-workbench/bin/python"
 "${WORKBENCH_PYTHON}" -m pip install \

@@ -7,7 +7,7 @@ WORKBENCH_PYTHON="${WORKBENCH_PYTHON:-python3}"
 
 if ! WORKBENCH_PYTHON_RESOLVED="$(command -v "${WORKBENCH_PYTHON}" 2>/dev/null)"; then
   echo "workbench Python not found: ${WORKBENCH_PYTHON}" >&2
-  echo "set WORKBENCH_PYTHON to a Python 3.10+ interpreter in the isolated workbench environment" >&2
+  echo "set WORKBENCH_PYTHON to a Python 3.11+ interpreter in the isolated workbench environment" >&2
   exit 1
 fi
 
@@ -18,12 +18,13 @@ import sys
 
 print(f"Resolved workbench interpreter: {sys.executable}")
 print(f"Workbench Python version: {platform.python_version()}")
-if sys.version_info < (3, 10):
+if sys.version_info < (3, 11):
     raise SystemExit(64)
 ' 2>&1)" || python_status=$?
 printf '%s\n' "${python_report}"
 if [[ "${python_status}" -ne 0 ]]; then
-  echo "Enterprise Agent Workbench requires Python 3.10 or newer" >&2
+  echo "Enterprise Agent Workbench requires Python 3.11 or newer" >&2
+  echo "Python 3.11+ is required for reliable async LangGraph HITL context propagation through interrupt and resume" >&2
   exit "${python_status}"
 fi
 
