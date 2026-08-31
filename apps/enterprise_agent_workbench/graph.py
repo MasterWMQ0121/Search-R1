@@ -43,6 +43,34 @@ PLANNER_FAILURE_ANSWER = (
     "The workbench stopped safely because the planner could not select a valid "
     "permitted action. No business action was executed."
 )
+_ROUTING_CONTROL_ARGUMENT_KEYS = frozenset(
+    {
+        "approval_decision",
+        "authorization",
+        "authorization_granted",
+        "idempotency_key",
+        "organization_id",
+        "requesting_role",
+        "requesting_user",
+        "role",
+        "run_id",
+        "tenant_id",
+        "thread_id",
+        "user_id",
+    }
+)
+_ROUTING_SECRET_ARGUMENT_KEYS = frozenset(
+    {
+        "api_key",
+        "authorization_header",
+        "client_secret",
+        "credential",
+        "credentials",
+        "password",
+        "secret",
+        "token",
+    }
+)
 
 
 class ApprovalResume(BaseModel):
@@ -174,6 +202,33 @@ def _sources_from_output(output: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(candidate, dict) and isinstance(candidate.get("source_id"), str):
             result.append(dict(candidate))
     return result
+
+
+def _safe_routing_arguments(value: Any) -> Any:
+    """Remove control-plane and secret fields from Replanner-visible arguments."""
+
+    if isinstance(value, dict):
+        safe: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
+            is_secret = normalized in _ROUTING_SECRET_ARGUMENT_KEYS or any(
+                normalized.endswith(suffix)
+                for suffix in (
+                    "_api_key",
+                    "_credential",
+                    "_credentials",
+                    "_password",
+                    "_secret",
+                    "_token",
+                )
+            )
+            if normalized in _ROUTING_CONTROL_ARGUMENT_KEYS or is_secret:
+                continue
+            safe[str(key)] = _safe_routing_arguments(item)
+        return safe
+    if isinstance(value, list):
+        return [_safe_routing_arguments(item) for item in value]
+    return value
 
 
 class WorkbenchGraph:
@@ -360,6 +415,35 @@ class WorkbenchGraph:
             tenant_id, role, decision.next_action, decision.arguments
         )
         return decision.model_copy(update={"arguments": arguments})
+
+    def _validated_invocation_arguments(
+        self, action: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Normalize a native invocation with the exact registered ToolSpec schema."""
+
+        return (
+            self.registry.get(action)
+            .input_model.model_validate(arguments)
+            .model_dump(mode="json")
+        )
+
+    @staticmethod
+    def _successful_tool_result(
+        *,
+        action: str,
+        validated_arguments: dict[str, Any],
+        output: dict[str, Any],
+        source_ids: list[str],
+    ) -> dict[str, Any]:
+        """Build the stable, safe routing envelope consumed by the Replanner."""
+
+        return {
+            "tool_name": action,
+            "status": "ok",
+            "arguments": _safe_routing_arguments(validated_arguments),
+            "output": output,
+            "source_ids": list(source_ids),
+        }
 
     def _planner_context(
         self, state: AgentState
@@ -851,9 +935,12 @@ class WorkbenchGraph:
             input_summary=arguments,
         )
         try:
+            validated_arguments = self._validated_invocation_arguments(
+                action, arguments
+            )
             output = await self.tool_gateway.execute(
                 action,
-                arguments,
+                validated_arguments,
                 context=self._tool_context(state),
                 state_counts={
                     "tool_call_count": int(state.get("tool_call_count", 0)),
@@ -865,12 +952,12 @@ class WorkbenchGraph:
                 },
             )
             sources = _sources_from_output(output)
-            result = {
-                "tool_name": action,
-                "status": "ok",
-                "output": output,
-                "source_ids": [source["source_id"] for source in sources],
-            }
+            result = self._successful_tool_result(
+                action=action,
+                validated_arguments=validated_arguments,
+                output=output,
+                source_ids=[source["source_id"] for source in sources],
+            )
             end_event = _trace(
                 state,
                 "tool_completed",
@@ -970,28 +1057,54 @@ class WorkbenchGraph:
             tool_name=action,
             input_summary=arguments,
         )
-        substate = await self.research_graph.ainvoke(
-            {
-                "query": str(arguments.get("query") or state["task"]),
-                "arguments": arguments,
-                "context": {
-                    "tenant_id": state["tenant_id"],
-                    "user_id": state["user_id"],
-                    "role": state["role"],
-                    "thread_id": state["thread_id"],
-                    "run_id": state["run_id"],
+        try:
+            validated_arguments = self._validated_invocation_arguments(
+                action, arguments
+            )
+        except (KeyError, ValidationError) as error:
+            # Preserve the existing fail-safe error result without exposing an
+            # unvalidated argument object to the Replanner.
+            substate = {
+                "tool_result": {
+                    "status": "error",
+                    "error_type": type(error).__name__,
+                    "message": _safe_summary(error),
                 },
+                "sources": [],
+                "failure_status": type(error).__name__,
             }
-        )
+        else:
+            substate = await self.research_graph.ainvoke(
+                {
+                    "query": str(validated_arguments.get("query") or state["task"]),
+                    "arguments": validated_arguments,
+                    "context": {
+                        "tenant_id": state["tenant_id"],
+                        "user_id": state["user_id"],
+                        "role": state["role"],
+                        "thread_id": state["thread_id"],
+                        "run_id": state["run_id"],
+                    },
+                }
+            )
         failed = bool(substate.get("failure_status"))
         output = substate.get("tool_result", {})
         sources = list(substate.get("sources", []))
-        result = {
-            "tool_name": "research_search",
-            "status": "error" if failed else "ok",
-            "output": output,
-            "source_ids": [source["source_id"] for source in sources],
-        }
+        result = (
+            {
+                "tool_name": action,
+                "status": "error",
+                "output": output,
+                "source_ids": [source["source_id"] for source in sources],
+            }
+            if failed
+            else self._successful_tool_result(
+                action=action,
+                validated_arguments=validated_arguments,
+                output=output,
+                source_ids=[source["source_id"] for source in sources],
+            )
+        )
         end_event = _trace(
             state,
             "tool_failed" if failed else "tool_completed",
@@ -1274,9 +1387,12 @@ class WorkbenchGraph:
             input_summary=arguments,
         )
         try:
+            validated_arguments = self._validated_invocation_arguments(
+                action, arguments
+            )
             output = await self.tool_gateway.execute(
                 action,
-                arguments,
+                validated_arguments,
                 context=self._tool_context(state, authorized=True),
                 state_counts={
                     "tool_call_count": int(state.get("tool_call_count", 0)),
@@ -1287,12 +1403,12 @@ class WorkbenchGraph:
                     "max_research_searches": self.settings.max_research_searches,
                 },
             )
-            result = {
-                "tool_name": action,
-                "status": "ok",
-                "output": output,
-                "source_ids": [],
-            }
+            result = self._successful_tool_result(
+                action=action,
+                validated_arguments=validated_arguments,
+                output=output,
+                source_ids=[],
+            )
             end_event = _trace(
                 state,
                 "tool_completed",

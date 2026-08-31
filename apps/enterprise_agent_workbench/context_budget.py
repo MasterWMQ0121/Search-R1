@@ -3,9 +3,58 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Mapping, Sequence
+
+
+_CONTROL_PLANE_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "approval_decision",
+        "auth",
+        "authorization",
+        "authorization_granted",
+        "authorization_header",
+        "client_secret",
+        "credential",
+        "credentials",
+        "idempotency_key",
+        "organization_id",
+        "password",
+        "refresh_token",
+        "requesting_role",
+        "requesting_user",
+        "role",
+        "run_id",
+        "secret",
+        "span_id",
+        "tenant_id",
+        "thread_id",
+        "trace_id",
+        "user_id",
+    }
+)
+_ROUTING_KEYS = frozenset(
+    {
+        "id",
+        "name",
+        "operation",
+        "source_id",
+        "source_ids",
+        "status",
+        "tool_name",
+        "type",
+    }
+)
+_LONG_TEXT_KEYS = frozenset(
+    {"content", "description", "evidence", "snippet", "text"}
+)
+_ARGUMENT_ENVELOPE_KEYS = frozenset(
+    {"arguments", "invocation_arguments", "validated_arguments"}
+)
 
 
 class BudgetAction(str, Enum):
@@ -237,16 +286,263 @@ class ContextBudgetManager:
             max(0, len(preferences) - len(compact_preferences)),
         )
 
-    def _compact_tool_result(self, result: Mapping[str, Any], budget: int) -> dict[str, Any]:
-        stable = {
-            key: result[key]
-            for key in ("tool_name", "status", "message", "error_type", "source_ids")
-            if key in result
-        }
-        if "output" in result:
-            remaining = max(0, budget - self.token_count(stable))
-            stable["output"] = self._truncate_text(self._text(result["output"]), remaining)
-        return stable
+    @staticmethod
+    def _normalized_key(key: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(key).casefold()).strip("_")
+
+    @classmethod
+    def _is_control_plane_key(cls, key: Any) -> bool:
+        normalized = cls._normalized_key(key)
+        return (
+            normalized in _CONTROL_PLANE_KEYS
+            or normalized.endswith("_api_key")
+            or normalized.endswith("_credential")
+            or normalized.endswith("_credentials")
+            or normalized.endswith("_password")
+            or normalized.endswith("_secret")
+            or normalized.endswith("_token")
+        )
+
+    @classmethod
+    def _is_routing_key(cls, key: Any) -> bool:
+        normalized = cls._normalized_key(key)
+        return (
+            normalized in _ROUTING_KEYS
+            or normalized.endswith("_id")
+            or normalized.endswith("_ids")
+            or normalized.endswith("_identifier")
+            or normalized.endswith("_identifiers")
+        )
+
+    @classmethod
+    def _is_long_text_key(cls, key: Any) -> bool:
+        normalized = cls._normalized_key(key)
+        return normalized in _LONG_TEXT_KEYS or any(
+            normalized.endswith(f"_{suffix}") for suffix in _LONG_TEXT_KEYS
+        )
+
+    @classmethod
+    def _sanitize_structured(cls, value: Any) -> Any:
+        """Remove control-plane metadata without flattening business payloads."""
+
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._sanitize_structured(value[key])
+                for key in sorted(value, key=lambda item: str(item))
+                if not cls._is_control_plane_key(key)
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._sanitize_structured(item) for item in value]
+        return value
+
+    @staticmethod
+    def _structured_placeholder(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {}
+        if isinstance(value, (list, tuple)):
+            return []
+        return None
+
+    def _routing_projection(
+        self,
+        value: Any,
+        *,
+        arguments: bool = False,
+        max_list_items: int = 8,
+        include_nested_lists: bool = True,
+    ) -> Any:
+        """Extract bounded facts that can safely ground a later route decision."""
+
+        if isinstance(value, Mapping):
+            output: dict[str, Any] = {}
+            for raw_key in sorted(value, key=lambda item: str(item)):
+                if self._is_control_plane_key(raw_key):
+                    continue
+                key = str(raw_key)
+                item = value[raw_key]
+                if self._is_routing_key(key):
+                    output[key] = self._sanitize_structured(item)
+                    continue
+                if arguments and not isinstance(item, (Mapping, list, tuple)):
+                    if isinstance(item, str) and self.token_count(item) > 64:
+                        item = self._truncate_text(item, 64)
+                    output[key] = item
+                    continue
+                if (
+                    isinstance(item, (list, tuple))
+                    and not include_nested_lists
+                ):
+                    continue
+                projected = self._routing_projection(
+                    item,
+                    arguments=arguments,
+                    max_list_items=max_list_items,
+                    include_nested_lists=include_nested_lists,
+                )
+                if projected not in ({}, [], None, ""):
+                    output[key] = projected
+            return output
+        if isinstance(value, (list, tuple)):
+            if not include_nested_lists:
+                return []
+            output_list: list[Any] = []
+            for item in value[:max_list_items]:
+                projected = self._routing_projection(
+                    item,
+                    arguments=arguments,
+                    max_list_items=max_list_items,
+                    include_nested_lists=include_nested_lists,
+                )
+                if projected not in ({}, [], None, ""):
+                    output_list.append(projected)
+            return output_list
+        return value if arguments else None
+
+    def _project_payload(
+        self,
+        value: Any,
+        *,
+        max_list_items: int,
+        max_text_tokens: int,
+        field_name: str = "",
+    ) -> Any:
+        """Keep JSON structure, identifiers and cheap scalars while bounding payload."""
+
+        if isinstance(value, Mapping):
+            output: dict[str, Any] = {}
+            keys = sorted(
+                value,
+                key=lambda item: (
+                    0 if self._is_routing_key(item) else 1,
+                    0 if self._normalized_key(item) == "derived_metrics" else 1,
+                    str(item),
+                ),
+            )
+            for raw_key in keys:
+                if self._is_control_plane_key(raw_key):
+                    continue
+                key = str(raw_key)
+                item = value[raw_key]
+                if self._is_routing_key(key):
+                    output[key] = self._sanitize_structured(item)
+                    continue
+                projected = self._project_payload(
+                    item,
+                    max_list_items=max_list_items,
+                    max_text_tokens=(
+                        min(max_text_tokens, 64)
+                        if self._is_long_text_key(key)
+                        else max_text_tokens
+                    ),
+                    field_name=key,
+                )
+                if projected not in ({}, [], None, "") or item is None:
+                    output[key] = projected
+            return output
+        if isinstance(value, (list, tuple)):
+            output_list: list[Any] = []
+            for item in value[:max_list_items]:
+                projected = self._project_payload(
+                    item,
+                    max_list_items=max_list_items,
+                    max_text_tokens=max_text_tokens,
+                    field_name=field_name,
+                )
+                if projected not in ({}, [], None, "") or item is None:
+                    output_list.append(projected)
+            return output_list
+        if isinstance(value, str):
+            if self._is_routing_key(field_name):
+                return value
+            if max_text_tokens <= 0:
+                return ""
+            return self._truncate_text(value, max_text_tokens)
+        return value
+
+    @classmethod
+    def _merge_required(cls, candidate: Any, required: Any) -> Any:
+        """Overlay the routing projection so payload reduction cannot erase it."""
+
+        if isinstance(required, Mapping):
+            merged = dict(candidate) if isinstance(candidate, Mapping) else {}
+            for key, value in required.items():
+                merged[key] = cls._merge_required(merged.get(key), value)
+            return merged
+        if isinstance(required, list):
+            merged_list = list(candidate) if isinstance(candidate, list) else []
+            for index, value in enumerate(required):
+                if index < len(merged_list):
+                    merged_list[index] = cls._merge_required(merged_list[index], value)
+                else:
+                    merged_list.append(value)
+            return merged_list
+        return required
+
+    def _tool_result_routing_envelope(
+        self, result: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        sanitized = self._sanitize_structured(result)
+        envelope: dict[str, Any] = {}
+        for key in sorted(sanitized):
+            value = sanitized[key]
+            if self._is_routing_key(key):
+                envelope[key] = value
+            elif key in _ARGUMENT_ENVELOPE_KEYS:
+                envelope[key] = self._routing_projection(value, arguments=True)
+            elif key == "output" and isinstance(value, (Mapping, list, tuple)):
+                # Direct output routing fields (for example ``operation``) are
+                # mandatory. Row/list identities are retained by richer
+                # projections when they fit, but are lower priority than the
+                # validated top-level invocation envelope.
+                projected = self._routing_projection(
+                    value, include_nested_lists=False
+                )
+                envelope[key] = (
+                    projected
+                    if projected not in ({}, [])
+                    else self._structured_placeholder(value)
+                )
+        return envelope
+
+    def _compact_tool_result(
+        self, result: Mapping[str, Any], budget: int
+    ) -> dict[str, Any]:
+        """Compact a result structurally, never by truncating serialized JSON."""
+
+        sanitized = self._sanitize_structured(result)
+        if self.token_count(sanitized) <= budget:
+            return sanitized
+
+        routing = self._tool_result_routing_envelope(sanitized)
+        routing_tokens = self.token_count(routing)
+        if routing_tokens > budget:
+            raise ValueError(
+                "routing-critical tool result metadata exceeds tool_results_budget"
+            )
+
+        # Richest fitting projection wins. Every candidate is overlaid with the
+        # routing envelope, so reducing rows/text cannot discard entity IDs or
+        # validated invocation arguments.
+        for max_list_items, max_text_tokens in (
+            (16, 128),
+            (8, 96),
+            (4, 64),
+            (2, 32),
+            (1, 16),
+            (1, 0),
+            # Drop row/list payload before compact mapping-based metrics.
+            (0, 16),
+            (0, 0),
+        ):
+            projected = self._project_payload(
+                sanitized,
+                max_list_items=max_list_items,
+                max_text_tokens=max_text_tokens,
+            )
+            candidate = self._merge_required(projected, routing)
+            if self.token_count(candidate) <= budget:
+                return candidate
+        return routing
 
     def _fit_tool_results(
         self, results: Sequence[Mapping[str, Any]], errors: Sequence[Mapping[str, Any]]
@@ -256,25 +552,80 @@ class ContextBudgetManager:
         original_errors = [dict(item) for item in errors]
         original = {"tool_results": original_results, "errors": original_errors}
         original_tokens = self.token_count(original)
-        if original_tokens <= budget:
-            return original_results, original_errors, BudgetDecision(
-                "tool_results", BudgetAction.KEEP, budget, original_tokens, original_tokens
+        sanitized_results = [self._sanitize_structured(item) for item in original_results]
+        sanitized_errors = [self._sanitize_structured(item) for item in original_errors]
+        sanitized = {"tool_results": sanitized_results, "errors": sanitized_errors}
+        sanitized_tokens = self.token_count(sanitized)
+        if sanitized_tokens <= budget:
+            action = BudgetAction.KEEP if sanitized == original else BudgetAction.COMPRESS
+            return sanitized_results, sanitized_errors, BudgetDecision(
+                "tool_results", action, budget, original_tokens, sanitized_tokens
             )
 
         kept_results: list[dict[str, Any]] = []
         kept_errors: list[dict[str, Any]] = []
-        for error in reversed(original_errors):
-            candidate = [error, *kept_errors]
-            if self.token_count({"tool_results": kept_results, "errors": candidate}) <= budget:
-                kept_errors = candidate
-        for result in reversed(original_results):
-            per_item_budget = max(64, budget // max(1, min(6, len(original_results))))
-            compact = self._compact_tool_result(result, per_item_budget)
-            candidate = [compact, *kept_results]
-            if self.token_count({"tool_results": candidate, "errors": kept_errors}) <= budget:
-                kept_results = candidate
+        empty_tokens = self.token_count({"tool_results": [], "errors": []})
+        if empty_tokens > budget:
+            raise ValueError("tool_results_budget cannot fit the result envelope")
+
+        # Successful results are semantically more valuable to the Replanner
+        # than error prose. Keep the newest routing envelope first, then use any
+        # remaining budget for structured payload and older results.
+        for result in reversed(sanitized_results):
+            routing = self._tool_result_routing_envelope(result)
+            routing_candidate = {
+                "tool_results": [routing, *kept_results],
+                "errors": kept_errors,
+            }
+            if self.token_count(routing_candidate) > budget:
+                if not kept_results:
+                    raise ValueError(
+                        "routing-critical tool result metadata exceeds tool_results_budget"
+                    )
+                continue
+
+            item_budget = budget
+            compact: dict[str, Any] | None = None
+            while item_budget >= self.token_count(routing):
+                proposed = self._compact_tool_result(result, item_budget)
+                candidate = {
+                    "tool_results": [proposed, *kept_results],
+                    "errors": kept_errors,
+                }
+                candidate_tokens = self.token_count(candidate)
+                if candidate_tokens <= budget:
+                    compact = proposed
+                    break
+                item_budget -= max(1, candidate_tokens - budget)
+            kept_results = [compact or routing, *kept_results]
+
+        # Errors are sanitized even when small and only consume headroom left
+        # after successful result semantics have been retained.
+        for error in reversed(sanitized_errors):
+            candidates = [error]
+            candidates.extend(
+                self._project_payload(
+                    error,
+                    max_list_items=max_list_items,
+                    max_text_tokens=max_text_tokens,
+                )
+                for max_list_items, max_text_tokens in ((4, 64), (1, 16), (1, 0))
+            )
+            for compact_error in candidates:
+                if not compact_error:
+                    continue
+                candidate_errors = [compact_error, *kept_errors]
+                candidate = {
+                    "tool_results": kept_results,
+                    "errors": candidate_errors,
+                }
+                if self.token_count(candidate) <= budget:
+                    kept_errors = candidate_errors
+                    break
         final = {"tool_results": kept_results, "errors": kept_errors}
         final_tokens = self.token_count(final)
+        if final_tokens > budget:
+            raise AssertionError("structured tool result compaction exceeded its budget")
         action = BudgetAction.COMPRESS if kept_results else BudgetAction.DROP
         return kept_results, kept_errors, BudgetDecision(
             "tool_results",

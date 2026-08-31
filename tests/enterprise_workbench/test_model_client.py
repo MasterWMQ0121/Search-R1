@@ -254,6 +254,180 @@ async def test_live_descriptive_action_is_semantically_repaired_to_exact_tool_id
 
 
 @pytest.mark.asyncio
+async def test_replanner_repairs_missing_campaign_id_from_bounded_live_context():
+    invalid = _decision(
+        objective="Explain why campaign ROI declined.",
+        next_action="get_campaign",
+        arguments={},
+    )
+    repaired = _decision(
+        objective="Explain why C102 ROI declined.",
+        next_action="get_campaign",
+        arguments={"campaign_id": "C102"},
+    )
+    responses = iter([json.dumps(invalid), json.dumps(repaired)])
+    prompts = []
+    prior_result = {
+        "tool_name": "roi_anomaly_detection",
+        "status": "ok",
+        "arguments": {
+            "campaign_id": "C102",
+            "start_date": "2025-01-01",
+            "idempotency_key": "must-not-leak-control-key",
+        },
+        "source_ids": ["CAMPAIGN-METRICS-C102"],
+        "output": {
+            "operation": "roi_anomaly_detection",
+            "campaign_id": "C102",
+            "rows": [
+                {
+                    "campaign_id": "C102",
+                    "description": "full-tool-output-must-not-leak",
+                }
+            ],
+            "hidden_reasoning": "private-chain-must-not-leak",
+            "api_key": "sk-supersecret999",
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompts.append(payload["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": next(responses)}}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = VLLMHTTPModelClient(
+            base_url="http://model.test/v1", model_name="local", http_client=http
+        )
+        result = await client.replan(
+            "Explain why C102 ROI declined.",
+            _planner_context(prior_tool_results=[prior_result]),
+        )
+
+    assert result.arguments == {"campaign_id": "C102"}
+    assert client.last_planner_repairs == 1
+    repair_prompt = prompts[1]
+    assert 'REPAIR_TASK="Explain why C102 ROI declined."' in repair_prompt
+    routing_line = next(
+        line for line in repair_prompt.splitlines() if line.startswith("ROUTING_CONTEXT=")
+    )
+    routing_context = json.loads(routing_line.removeprefix("ROUTING_CONTEXT="))
+    previous = routing_context["previous_tools"][0]
+    assert previous["tool_name"] == "roi_anomaly_detection"
+    assert previous["arguments"] == {
+        "campaign_id": "C102",
+        "start_date": "2025-01-01",
+    }
+    assert previous["source_ids"] == ["CAMPAIGN-METRICS-C102"]
+    assert previous["routing_facts"]["operation"] == "roi_anomaly_detection"
+    assert len(json.dumps(routing_context)) <= 4_000
+    assert "idempotency_key" not in routing_line
+    for forbidden in (
+        "must-not-leak-control-key",
+        "full-tool-output-must-not-leak",
+        "private-chain-must-not-leak",
+        "sk-supersecret999",
+    ):
+        assert forbidden not in repair_prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task", "invented_campaign_id"),
+    [
+        ("Explain why ROI declined.", "C102"),
+        ("Explain why C102 ROI declined.", "C999"),
+    ],
+)
+async def test_repair_rejects_campaign_id_not_grounded_in_task_or_routing_context(
+    task, invented_campaign_id
+):
+    invalid = _decision(
+        next_action="get_campaign",
+        arguments={},
+    )
+    repaired = _decision(
+        objective="Explain why campaign ROI declined.",
+        next_action="get_campaign",
+        arguments={"campaign_id": invented_campaign_id},
+    )
+    responses = iter([json.dumps(invalid), json.dumps(repaired)])
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": next(responses)}}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = VLLMHTTPModelClient(
+            base_url="http://model.test/v1", model_name="local", http_client=http
+        )
+        with pytest.raises(
+            PlannerSemanticError,
+            match="ungrounded business arguments: arguments.campaign_id",
+        ):
+            await client.replan(task, _planner_context())
+
+    assert calls == 2
+    assert client.last_planner_repairs == 1
+    assert len(client.last_planner_failure_signatures) == 2
+
+
+@pytest.mark.asyncio
+async def test_repair_prompt_sanitizes_invalid_response_and_task_payloads():
+    invalid = _decision(
+        objective="Read C102 with api_key=sk-supersecret999",
+        arguments={
+            "campaign_id": "C102",
+            "idempotency_key": "model-control-key-must-not-leak",
+        },
+        user_visible_reason="hidden_reasoning=private-chain-must-not-leak",
+    )
+    repaired = _decision(arguments={"campaign_id": "C102"})
+    responses = iter([json.dumps(invalid), json.dumps(repaired)])
+    prompts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        prompts.append(payload["messages"][0]["content"])
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": next(responses)}}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = VLLMHTTPModelClient(
+            base_url="http://model.test/v1", model_name="local", http_client=http
+        )
+        result = await client.plan(
+            "Read C102; token=task-secret-must-not-leak", _planner_context()
+        )
+
+    assert result.arguments == {"campaign_id": "C102"}
+    repair_prompt = prompts[1]
+    assert "[REDACTED]" in repair_prompt
+    invalid_line = next(
+        line for line in repair_prompt.splitlines() if line.startswith("INVALID_RESPONSE=")
+    )
+    assert "idempotency_key" not in invalid_line
+    assert len(invalid_line.removeprefix("INVALID_RESPONSE=")) <= 2_000
+    for forbidden in (
+        "sk-supersecret999",
+        "model-control-key-must-not-leak",
+        "private-chain-must-not-leak",
+        "task-secret-must-not-leak",
+    ):
+        assert forbidden not in repair_prompt
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid_arguments, expected_error",
     [
@@ -305,7 +479,9 @@ async def test_semantic_argument_errors_share_the_single_repair_budget(
         client = VLLMHTTPModelClient(
             base_url="http://model.test/v1", model_name="local", http_client=http
         )
-        result = await client.plan("Update C102", _planner_context())
+        result = await client.plan(
+            "Update C102 daily budget to 1200", _planner_context()
+        )
 
     assert result.next_action == "update_campaign_budget"
     assert result.arguments == {"campaign_id": "C102", "daily_budget": 1200}
@@ -349,6 +525,41 @@ async def test_caller_tool_schema_validation_shares_the_single_repair_budget():
     assert len(prompts) == 2
     assert "actual tool schema" in prompts[1]
     assert "validate_real_tool_schema" not in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_repair_grounding_ignores_defaults_added_by_caller_validation():
+    invalid = _decision(arguments={})
+    repaired = _decision(arguments={"campaign_id": "C102"})
+    responses = iter([json.dumps(invalid), json.dumps(repaired)])
+    context = _planner_context()
+    context["available_tools"][0]["arguments"]["top_k"] = {
+        "type": "integer",
+        "required": False,
+    }
+
+    def add_tool_default(decision):
+        return decision.model_copy(
+            update={"arguments": {**decision.arguments, "top_k": 3}}
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": next(responses)}}]},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = VLLMHTTPModelClient(
+            base_url="http://model.test/v1", model_name="local", http_client=http
+        )
+        result = await client.plan(
+            "Read C102",
+            {**context, "_planner_decision_validator": add_tool_default},
+        )
+
+    assert result.arguments == {"campaign_id": "C102", "top_k": 3}
+    assert client.last_planner_repairs == 1
 
 
 @pytest.mark.asyncio
@@ -431,9 +642,9 @@ async def test_concurrent_planner_repairs_use_task_local_budget_and_diagnostics(
 
     def handler(request: httpx.Request) -> httpx.Response:
         prompt = json.loads(request.content)["messages"][0]["content"]
-        if "INVALID_RESPONSE=invalid-allowed" in prompt:
+        if prompt.startswith("Repair the following invalid planner response"):
             content = valid
-        elif "TASK=allowed-task" in prompt:
+        elif "TASK=allowed-task C102" in prompt:
             content = "invalid-allowed"
         elif "TASK=denied-task" in prompt:
             content = "invalid-denied"
@@ -452,7 +663,7 @@ async def test_concurrent_planner_repairs_use_task_local_budget_and_diagnostics(
         async def allowed_call():
             client.repair_allowed = True
             await denied_has_set_budget.wait()
-            decision = await client.plan("allowed-task", _planner_context())
+            decision = await client.plan("allowed-task C102", _planner_context())
             return decision, client.last_planner_repairs
 
         async def denied_call():
