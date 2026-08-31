@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import WorkbenchSettings
 from .citations import citation_coverage, validate_citations
+from .context_budget import ContextBudgetConfig, ContextBudgetManager
 from .model_client import (
     PlannerDecision,
     PlannerParseError,
@@ -23,9 +24,11 @@ from .model_client import (
     WorkbenchModelClient,
     validate_planner_decision,
 )
-from .policy import PolicyEngine
+from .observability import RuntimeObservability
 from .state import AgentState
+from .tool_gateway import ToolGateway, ToolInvocationContext
 from .tool_registry import ToolRegistry
+from .tools.research_search import DeterministicTextTokenizer
 
 
 READ_NODE_ALIASES = {
@@ -78,7 +81,8 @@ def _safe_summary(value: Any, *, limit: int = 400) -> str:
 
 def deterministic_idempotency_key(
     *,
-    organization_id: str,
+    organization_id: str | None = None,
+    tenant_id: str | None = None,
     user_id: str,
     thread_id: str,
     run_id: str,
@@ -87,9 +91,14 @@ def deterministic_idempotency_key(
 ) -> str:
     """Bind one control-plane write identity to a run and canonical arguments."""
 
+    canonical_tenant = (tenant_id or organization_id or "").strip()
+    if not canonical_tenant:
+        raise ValueError("tenant_id is required for idempotency")
+    if organization_id and organization_id.strip() != canonical_tenant:
+        raise ValueError("tenant_id and organization_id must match")
     payload = {
         "schema_version": 1,
-        "organization_id": organization_id,
+        "tenant_id": canonical_tenant,
         "user_id": user_id,
         "thread_id": thread_id,
         "run_id": run_id,
@@ -139,6 +148,7 @@ def _trace(
     return {
         "sequence": -1,
         "timestamp": _utc_now(),
+        "tenant_id": state.get("tenant_id", state.get("organization_id", "")),
         "thread_id": state.get("thread_id", ""),
         "run_id": state.get("run_id", ""),
         "event_type": event_type,
@@ -176,12 +186,34 @@ class WorkbenchGraph:
         registry: ToolRegistry,
         memory_store: Any,
         settings: WorkbenchSettings,
+        tool_gateway: ToolGateway | None = None,
+        context_budget_manager: ContextBudgetManager | None = None,
+        observability: RuntimeObservability | None = None,
     ) -> None:
         self.model_client = model_client
         self.registry = registry
         self.memory_store = memory_store
         self.settings = settings
-        self.policy = PolicyEngine(registry)
+        self.observability = observability or RuntimeObservability()
+        self.tool_gateway = tool_gateway or ToolGateway(
+            registry, observability=self.observability
+        )
+        # Compatibility handle for existing policy inspection/tests. Gateway
+        # policy evaluation delegates to this same engine instance.
+        self.policy = self.tool_gateway.policy_engine
+        self.context_budget_manager = context_budget_manager or ContextBudgetManager(
+            DeterministicTextTokenizer(),
+            ContextBudgetConfig(
+                total_context=settings.context_total_tokens,
+                generation_reserve=settings.generation_reserve_tokens,
+                safety_margin=settings.context_safety_margin_tokens,
+                system_budget=settings.system_context_budget,
+                tool_catalog_budget=settings.tool_catalog_context_budget,
+                memory_budget=settings.memory_context_budget,
+                tool_results_budget=settings.tool_results_context_budget,
+                current_task_budget=settings.current_task_context_budget,
+            ),
+        )
         self.research_graph = self._build_research_subgraph().compile()
 
     def _build_research_subgraph(self) -> StateGraph:
@@ -308,7 +340,7 @@ class WorkbenchGraph:
         preferences: dict[str, Any] = {}
         getter = getattr(self.memory_store, "list_preferences", None)
         if getter is not None:
-            value = getter(state["organization_id"], state["user_id"])
+            value = getter(state["tenant_id"], state["user_id"])
             preferences = await value if asyncio.iscoroutine(value) else value
         event = _trace(
             state,
@@ -320,58 +352,122 @@ class WorkbenchGraph:
         return {**self._step(state, event), "user_preferences": preferences}
 
     def _validate_planner_tool_contract(
-        self, role: str, decision: PlannerDecision
+        self, tenant_id: str, role: str, decision: PlannerDecision
     ) -> PlannerDecision:
         if decision.next_action == "finalizer":
             return decision
-        arguments = self.registry.validate_planner_arguments(
-            role, decision.next_action, decision.arguments
+        arguments = self.tool_gateway.validate_planner_arguments(
+            tenant_id, role, decision.next_action, decision.arguments
         )
         return decision.model_copy(update={"arguments": arguments})
 
-    def _planner_context(self, state: AgentState) -> dict[str, Any]:
+    def _planner_context(
+        self, state: AgentState
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         role = state.get("role", "viewer")
-        return {
-            "conversation_summary": state.get("conversation_summary", ""),
-            "preferences": state.get("user_preferences", {}),
-            "available_tools": self.registry.planner_metadata(role),
-            "_planner_decision_validator": (
-                lambda decision: self._validate_planner_tool_contract(role, decision)
+        tenant_id = state.get("tenant_id", state.get("organization_id", ""))
+        limits = {
+            "remaining_steps": max(
+                0,
+                self.settings.max_graph_steps - int(state.get("step_count", 0)),
             ),
-            "prior_tool_results": state.get("tool_results", [])[-6:],
-            "errors": state.get("errors", [])[-3:],
-            "limits": {
-                "remaining_steps": max(
-                    0,
-                    self.settings.max_graph_steps - int(state.get("step_count", 0)),
-                ),
-                "remaining_tools": max(
-                    0,
-                    self.settings.max_tool_calls
-                    - int(state.get("tool_call_count", 0)),
-                ),
-            },
+            "remaining_tools": max(
+                0,
+                self.settings.max_tool_calls
+                - int(state.get("tool_call_count", 0)),
+            ),
         }
+        task, context, report = self.context_budget_manager.build_planner_context(
+            task=state["task"],
+            conversation_summary=state.get("conversation_summary", ""),
+            preferences=state.get("user_preferences", {}),
+            tool_catalog=self.tool_gateway.planner_metadata(tenant_id, role),
+            tool_results=state.get("tool_results", [])[-6:],
+            errors=state.get("errors", [])[-3:],
+            limits=limits,
+        )
+        context["_planner_decision_validator"] = (
+            lambda decision: self._validate_planner_tool_contract(
+                tenant_id, role, decision
+            )
+        )
+        report_dict = report.as_dict()
+        labels = {"tenant_id": tenant_id}
+        self.observability.observe(
+            "context_tokens", report.context_tokens, **labels
+        )
+        self.observability.counter(
+            "compressed_tokens", report.compressed_tokens, **labels
+        )
+        self.observability.observe(
+            "budget_headroom", report.budget_headroom, **labels
+        )
+        self.observability.counter("input_tokens", report.context_tokens, **labels)
+        return task, context, report_dict
+
+    async def _call_planner_model(
+        self,
+        state: AgentState,
+        *,
+        node: str,
+        replan: bool,
+        task: str,
+        planner_context: dict[str, Any],
+    ) -> PlannerDecision:
+        tenant_id = state.get("tenant_id", state.get("organization_id", ""))
+        started = time.perf_counter()
+        try:
+            with self.observability.span(
+                "Replanner" if replan else "Planner",
+                {
+                    "tenant.id": tenant_id,
+                    "thread.id": state.get("thread_id", ""),
+                    "run.id": state.get("run_id", ""),
+                },
+            ):
+                with self.observability.span(
+                    "LLM/Replanner" if replan else "LLM/Planner"
+                ):
+                    if replan:
+                        return await self.model_client.replan(task, planner_context)
+                    return await self.model_client.plan(task, planner_context)
+        finally:
+            elapsed = max(0.0, time.perf_counter() - started)
+            self.observability.observe(
+                "replanner.latency" if replan else "planner.latency",
+                elapsed,
+                tenant_id=tenant_id,
+            )
+            self.observability.observe(
+                "llm.latency", elapsed, tenant_id=tenant_id, operation=node
+            )
 
     async def _decide(self, state: AgentState, *, replan: bool) -> dict[str, Any]:
         node = "replanner" if replan else "planner"
         started = time.perf_counter()
-        planner_context = self._planner_context(state)
+        planner_task, planner_context, budget_report = self._planner_context(state)
         if hasattr(self.model_client, "repair_allowed"):
             self.model_client.repair_allowed = (
                 int(state.get("planner_repair_count", 0))
                 < self.settings.max_planner_repairs
             )
         try:
-            if replan:
-                decision = await self.model_client.replan(
-                    state["task"], planner_context
-                )
-            else:
-                decision = await self.model_client.plan(
-                    state["task"], planner_context
-                )
+            decision = await self._call_planner_model(
+                state,
+                node=node,
+                replan=replan,
+                task=planner_task,
+                planner_context=planner_context,
+            )
         except PlannerParseError as error:
+            repair_attempts = int(getattr(error, "repair_attempts", 0))
+            if repair_attempts:
+                self.observability.counter(
+                    "planner.repairs",
+                    repair_attempts,
+                    tenant_id=state["tenant_id"],
+                    operation=node,
+                )
             failure_signatures = list(
                 getattr(self.model_client, "last_planner_failure_signatures", [])
             )
@@ -399,13 +495,14 @@ class WorkbenchGraph:
             )
             return {
                 **self._step(state, event),
+                "context_budget": budget_report,
                 "errors": [failure],
                 "next_action": "finalizer",
                 "action_arguments": {},
                 "completed": False,
                 "termination_reason": error_code,
                 "planner_repair_count": int(state.get("planner_repair_count", 0))
-                + int(getattr(error, "repair_attempts", 0)),
+                + repair_attempts,
                 "planner_failure_signatures": [
                     *prior_signatures,
                     *failure_signatures,
@@ -428,6 +525,7 @@ class WorkbenchGraph:
             )
             return {
                 **self._step(state, event),
+                "context_budget": budget_report,
                 "errors": [failure],
                 "next_action": "finalizer",
                 "action_arguments": {},
@@ -465,6 +563,7 @@ class WorkbenchGraph:
             )
             return {
                 **self._step(state, event),
+                "context_budget": budget_report,
                 "errors": [failure],
                 "next_action": "finalizer",
                 "action_arguments": {},
@@ -486,13 +585,16 @@ class WorkbenchGraph:
             if action == "finalizer":
                 action_arguments: dict[str, Any] = {}
             else:
-                business_arguments = self.registry.validate_planner_arguments(
-                    state.get("role", "viewer"), action, decision.arguments
+                business_arguments = self.tool_gateway.validate_planner_arguments(
+                    state["tenant_id"],
+                    state.get("role", "viewer"),
+                    action,
+                    decision.arguments,
                 )
                 spec = self.registry.get(action)
                 if spec.side_effecting:
                     idempotency_key = deterministic_idempotency_key(
-                        organization_id=state["organization_id"],
+                        tenant_id=state["tenant_id"],
                         user_id=state["user_id"],
                         thread_id=state["thread_id"],
                         run_id=state["run_id"],
@@ -527,6 +629,7 @@ class WorkbenchGraph:
             )
             return {
                 **self._step(state, event),
+                "context_budget": budget_report,
                 "errors": [
                     {"code": error_code, "message": str(error), "node": node}
                 ],
@@ -554,6 +657,19 @@ class WorkbenchGraph:
             },
         )
         repair_count = int(getattr(self.model_client, "last_planner_repairs", 0))
+        self.observability.counter(
+            "output_tokens",
+            self.context_budget_manager.token_count(payload),
+            tenant_id=state["tenant_id"],
+            operation=node,
+        )
+        if repair_count:
+            self.observability.counter(
+                "planner.repairs",
+                repair_count,
+                tenant_id=state["tenant_id"],
+                operation=node,
+            )
         events = []
         if repair_count:
             events.append(
@@ -570,6 +686,7 @@ class WorkbenchGraph:
         events.append(decision_event)
         return {
             **self._step(state, *events),
+            "context_budget": budget_report,
             "plan": [*state.get("plan", []), payload],
             "next_action": decision.next_action,
             "action_arguments": action_arguments,
@@ -592,6 +709,21 @@ class WorkbenchGraph:
         action = str(state.get("next_action") or "")
         arguments = dict(state.get("action_arguments") or {})
         return action, arguments
+
+    @staticmethod
+    def _tool_context(
+        state: AgentState, *, authorized: bool = False
+    ) -> ToolInvocationContext:
+        approval_decision = (state.get("approval_decision") or {}).get("decision")
+        return ToolInvocationContext(
+            tenant_id=state["tenant_id"],
+            user_id=state["user_id"],
+            role=state.get("role", "viewer"),
+            thread_id=state["thread_id"],
+            run_id=state["run_id"],
+            authorization_granted=authorized,
+            approval_decision=(str(approval_decision) if approval_decision else None),
+        )
 
     async def policy_and_route(self, state: AgentState) -> dict[str, Any]:
         if int(state.get("step_count", 0)) >= self.settings.max_graph_steps:
@@ -618,11 +750,12 @@ class WorkbenchGraph:
             )
             return {**self._step(state, event), "route": "finalizer"}
 
-        decision = self.policy.evaluate(
-            state.get("role", "viewer"),
-            action,
-            arguments,
-            {
+        decision = self.tool_gateway.evaluate_policy(
+            tenant_id=state["tenant_id"],
+            role=state.get("role", "viewer"),
+            tool_name=action,
+            arguments=arguments,
+            state_counts={
                 "tool_call_count": int(state.get("tool_call_count", 0)),
                 "max_tool_calls": self.settings.max_tool_calls,
                 "research_search_count": int(state.get("research_search_count", 0)),
@@ -718,9 +851,18 @@ class WorkbenchGraph:
             input_summary=arguments,
         )
         try:
-            output = await asyncio.wait_for(
-                self.registry.execute(action, arguments),
-                timeout=self.settings.tool_timeout_seconds,
+            output = await self.tool_gateway.execute(
+                action,
+                arguments,
+                context=self._tool_context(state),
+                state_counts={
+                    "tool_call_count": int(state.get("tool_call_count", 0)),
+                    "max_tool_calls": self.settings.max_tool_calls,
+                    "research_search_count": int(
+                        state.get("research_search_count", 0)
+                    ),
+                    "max_research_searches": self.settings.max_research_searches,
+                },
             )
             sources = _sources_from_output(output)
             result = {
@@ -790,8 +932,17 @@ class WorkbenchGraph:
 
     async def _research_once(self, state: ResearchState) -> dict[str, Any]:
         try:
-            output = await self.registry.execute(
-                "research_search", state.get("arguments", {"query": state["query"]})
+            invocation = ToolInvocationContext(
+                tenant_id=str(state["context"]["tenant_id"]),
+                user_id=str(state["context"]["user_id"]),
+                role=str(state["context"]["role"]),
+                thread_id=str(state["context"]["thread_id"]),
+                run_id=str(state["context"]["run_id"]),
+            )
+            output = await self.tool_gateway.execute(
+                "research_search",
+                state.get("arguments", {"query": state["query"]}),
+                context=invocation,
             )
             return {
                 "tool_result": output,
@@ -824,6 +975,9 @@ class WorkbenchGraph:
                 "query": str(arguments.get("query") or state["task"]),
                 "arguments": arguments,
                 "context": {
+                    "tenant_id": state["tenant_id"],
+                    "user_id": state["user_id"],
+                    "role": state["role"],
                     "thread_id": state["thread_id"],
                     "run_id": state["run_id"],
                 },
@@ -887,11 +1041,12 @@ class WorkbenchGraph:
 
     def _policy_for_pending(self, state: AgentState) -> dict[str, Any]:
         pending = state.get("pending_action") or {}
-        return self.policy.evaluate(
-            state.get("role", "viewer"),
-            str(pending.get("action", "")),
-            pending.get("arguments", {}),
-            {
+        return self.tool_gateway.evaluate_policy(
+            tenant_id=state["tenant_id"],
+            role=state.get("role", "viewer"),
+            tool_name=str(pending.get("action", "")),
+            arguments=pending.get("arguments", {}),
+            state_counts={
                 "tool_call_count": int(state.get("tool_call_count", 0)),
                 "max_tool_calls": self.settings.max_tool_calls,
                 "research_search_count": int(state.get("research_search_count", 0)),
@@ -983,6 +1138,7 @@ class WorkbenchGraph:
             **self._step(state, event),
             "authorization_route": "human_approval_interrupt",
             "approval_request": request,
+            "approval_requested_at": _utc_now(),
             "pending_action": pending,
         }
 
@@ -998,6 +1154,20 @@ class WorkbenchGraph:
             decision = ApprovalResume.model_validate(raw_decision)
         except ValidationError as error:
             raise ValueError(f"invalid approval decision: {error}") from error
+
+        wait_seconds = 0.0
+        requested_at = state.get("approval_requested_at")
+        if requested_at:
+            try:
+                started_at = datetime.fromisoformat(str(requested_at))
+                wait_seconds = max(
+                    0.0, (datetime.now(timezone.utc) - started_at).total_seconds()
+                )
+            except ValueError:
+                wait_seconds = 0.0
+        self.observability.observe(
+            "hitl.wait_time", wait_seconds, tenant_id=state["tenant_id"]
+        )
 
         pending = dict(state.get("pending_action") or {})
         event_type = {
@@ -1022,11 +1192,12 @@ class WorkbenchGraph:
                         f"approval edits cannot change {immutable_field}; "
                         "submit a new action for a different target or identity"
                     )
-            policy_decision = self.policy.evaluate(
-                state.get("role", "viewer"),
-                str(pending.get("action", "")),
-                edited_arguments,
-                {
+            policy_decision = self.tool_gateway.evaluate_policy(
+                tenant_id=state["tenant_id"],
+                role=state.get("role", "viewer"),
+                tool_name=str(pending.get("action", "")),
+                arguments=edited_arguments,
+                state_counts={
                     "tool_call_count": int(state.get("tool_call_count", 0)),
                     "max_tool_calls": self.settings.max_tool_calls,
                     "research_search_count": int(
@@ -1051,6 +1222,7 @@ class WorkbenchGraph:
         return {
             **self._step(state, event),
             "approval_decision": decision.model_dump(mode="json"),
+            "approval_requested_at": None,
             "pending_action": pending,
         }
 
@@ -1101,17 +1273,20 @@ class WorkbenchGraph:
             tool_name=action,
             input_summary=arguments,
         )
-        context = {
-            "thread_id": state["thread_id"],
-            "user_id": state["user_id"],
-            "role": state["role"],
-            "authorization_granted": True,
-            "approval_decision": (state.get("approval_decision") or {}).get(
-                "decision"
-            ),
-        }
         try:
-            output = await self.registry.execute(action, arguments, context)
+            output = await self.tool_gateway.execute(
+                action,
+                arguments,
+                context=self._tool_context(state, authorized=True),
+                state_counts={
+                    "tool_call_count": int(state.get("tool_call_count", 0)),
+                    "max_tool_calls": self.settings.max_tool_calls,
+                    "research_search_count": int(
+                        state.get("research_search_count", 0)
+                    ),
+                    "max_research_searches": self.settings.max_research_searches,
+                },
+            )
             result = {
                 "tool_name": action,
                 "status": "ok",
@@ -1206,7 +1381,28 @@ class WorkbenchGraph:
                 ),
             )
         started = time.perf_counter()
-        summary = await self.model_client.summarize_memory(messages)
+        with self.observability.span("MemorySummary"):
+            with self.observability.span("LLM/MemorySummary"):
+                summary = await self.model_client.summarize_memory(messages)
+        elapsed = max(0.0, time.perf_counter() - started)
+        self.observability.observe(
+            "llm.latency",
+            elapsed,
+            tenant_id=state["tenant_id"],
+            operation="memory_summary",
+        )
+        self.observability.counter(
+            "input_tokens",
+            self.context_budget_manager.token_count(messages),
+            tenant_id=state["tenant_id"],
+            operation="memory_summary",
+        )
+        self.observability.counter(
+            "output_tokens",
+            self.context_budget_manager.token_count(summary),
+            tenant_id=state["tenant_id"],
+            operation="memory_summary",
+        )
         event = _trace(
             state,
             "node_completed",
@@ -1217,6 +1413,17 @@ class WorkbenchGraph:
         return {**self._step(state, event), "conversation_summary": summary}
 
     async def finalizer(self, state: AgentState) -> dict[str, Any]:
+        with self.observability.span(
+            "Finalizer",
+            {
+                "tenant.id": state.get("tenant_id", ""),
+                "thread.id": state.get("thread_id", ""),
+                "run.id": state.get("run_id", ""),
+            },
+        ):
+            return await self._finalize(state)
+
+    async def _finalize(self, state: AgentState) -> dict[str, Any]:
         started = time.perf_counter()
         if state.get("termination_reason") in {
             "planner_semantic_error",
@@ -1239,12 +1446,32 @@ class WorkbenchGraph:
                 "completed": False,
             }
         try:
-            answer = await self.model_client.synthesize(
-                state["task"],
-                [
-                    *state.get("tool_results", []),
-                    {"available_sources": state.get("sources", [])},
-                ],
+            evidence = [
+                *state.get("tool_results", []),
+                {"available_sources": state.get("sources", [])},
+            ]
+            with self.observability.span("LLM/Finalizer"):
+                answer = await self.model_client.synthesize(state["task"], evidence)
+            elapsed = max(0.0, time.perf_counter() - started)
+            self.observability.observe(
+                "llm.latency",
+                elapsed,
+                tenant_id=state["tenant_id"],
+                operation="finalizer",
+            )
+            self.observability.counter(
+                "input_tokens",
+                self.context_budget_manager.token_count(
+                    {"task": state["task"], "evidence": evidence}
+                ),
+                tenant_id=state["tenant_id"],
+                operation="finalizer",
+            )
+            self.observability.counter(
+                "output_tokens",
+                self.context_budget_manager.token_count(answer),
+                tenant_id=state["tenant_id"],
+                operation="finalizer",
             )
             event = _trace(
                 state,
@@ -1259,6 +1486,12 @@ class WorkbenchGraph:
                 "messages": [{"role": "assistant", "content": answer}],
             }
         except Exception as error:
+            self.observability.observe(
+                "llm.latency",
+                max(0.0, time.perf_counter() - started),
+                tenant_id=state["tenant_id"],
+                operation="finalizer",
+            )
             answer = (
                 "The workbench could not complete final synthesis. "
                 "Available tool results remain visible in the execution record."

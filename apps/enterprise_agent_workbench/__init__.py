@@ -15,13 +15,25 @@ import os
 os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
 
 from .citations import SourceRecord
+from .context_budget import ContextBudgetManager
+from .mcp_adapter import MCPToolAdapter
 from .model_client import PlannerDecision, WorkbenchModelClient
+from .observability import RuntimeObservability
+from .sdk import AgentRuntimeClient
 from .state import AgentState, initial_agent_state
+from .tool_gateway import TenantToolPolicy, ToolGateway, ToolInvocationContext
 
 __all__ = [
     "AgentState",
+    "AgentRuntimeClient",
+    "ContextBudgetManager",
+    "MCPToolAdapter",
     "PlannerDecision",
     "SourceRecord",
+    "RuntimeObservability",
+    "TenantToolPolicy",
+    "ToolGateway",
+    "ToolInvocationContext",
     "WorkbenchModelClient",
     "initial_agent_state",
 ]

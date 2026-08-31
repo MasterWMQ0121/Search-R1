@@ -6,32 +6,35 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from .citations import SourceRecord
+from .context_budget import ContextBudgetConfig, ContextBudgetManager
 from .config import (
     ENTERPRISE_DOCS_ROOT,
     MERCHANT_SEED_PATH,
     WorkbenchSettings,
 )
 from .graph import WorkbenchGraph
+from .mcp_adapter import MCPToolAdapter
 from .memory import MemoryValidationError, PreferenceMemoryStore
 from .model_client import VLLMHTTPModelClient, WorkbenchModelClient
-from .policy import PolicyEngine
+from .observability import ObservabilityConfig, RuntimeObservability
 from .state import AgentState, Role, initial_agent_state
 from .tokenizer_runtime import (
     TokenizerRuntime,
@@ -39,6 +42,12 @@ from .tokenizer_runtime import (
     load_tokenizer_runtime,
 )
 from .tool_registry import ToolRegistry, build_default_registry
+from .tool_gateway import (
+    TenantToolPolicy,
+    ToolAccessDenied,
+    ToolGateway,
+    ToolInvocationContext,
+)
 from .tools.campaign_api import CampaignAPI, initialize_demo_database
 from .tools.enterprise_kb import EnterpriseKnowledgeBase
 from .tools.merchant_analytics import MerchantAnalytics
@@ -56,19 +65,33 @@ class ThreadCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     user_id: str = Field(min_length=1, max_length=200)
-    organization_id: str = Field(min_length=1, max_length=200)
+    tenant_id: str | None = Field(default=None, min_length=1, max_length=200)
+    organization_id: str | None = Field(default=None, min_length=1, max_length=200)
     role: Role
+
+    @model_validator(mode="after")
+    def canonicalize_tenant(self) -> "ThreadCreateRequest":
+        tenant = self.tenant_id or self.organization_id
+        if tenant is None:
+            raise ValueError("tenant_id is required")
+        if self.tenant_id and self.organization_id and self.tenant_id != self.organization_id:
+            raise ValueError("tenant_id and organization_id must match")
+        object.__setattr__(self, "tenant_id", tenant)
+        object.__setattr__(self, "organization_id", tenant)
+        return self
 
 
 class RunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    tenant_id: str = Field(min_length=1, max_length=200)
     task: str = Field(min_length=1, max_length=10_000)
 
 
 class ResumeRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    tenant_id: str = Field(min_length=1, max_length=200)
     decision: Literal["approve", "edit", "reject"]
     edited_arguments: dict[str, Any] | None = None
     feedback: str | None = Field(default=None, max_length=1_000)
@@ -85,7 +108,7 @@ class ResumeRequest(BaseModel):
 class PreferencePutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    organization_id: str = Field(min_length=1, max_length=200)
+    tenant_id: str = Field(min_length=1, max_length=200)
     value: str | int | float | bool
 
 
@@ -110,13 +133,30 @@ class HealthResponse(BaseModel):
     model_name: str
     retriever_configuration: dict[str, Any]
     runtime_configuration_fingerprint: str
+    observability_enabled: bool
+    otlp_export_configured: bool
+    context_budget: dict[str, int]
 
 
 class ToolsResponse(BaseModel):
     tools: list[dict[str, Any]]
 
 
+class MCPCallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: str = Field(min_length=1, max_length=200)
+    user_id: str = Field(min_length=1, max_length=200)
+    role: Role
+    name: str = Field(min_length=1, max_length=200)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    version: str | None = Field(default=None, min_length=1, max_length=50)
+    thread_id: str = Field(default="mcp-adapter", min_length=1, max_length=200)
+    run_id: str = Field(default="mcp-call", min_length=1, max_length=200)
+
+
 class RunAcceptedResponse(BaseModel):
+    tenant_id: str
     thread_id: str
     run_id: str
     status: str
@@ -132,6 +172,7 @@ class SafeStateResponse(BaseModel):
 
     thread_id: str
     run_id: str | None = None
+    tenant_id: str | None = None
     user_id: str | None = None
     organization_id: str | None = None
     role: Role | None = None
@@ -139,6 +180,7 @@ class SafeStateResponse(BaseModel):
     task: str | None = None
     messages: list[dict[str, Any]] = Field(default_factory=list)
     conversation_summary: str = ""
+    context_budget: dict[str, Any] = Field(default_factory=dict)
     user_preferences: dict[str, Any] = Field(default_factory=dict)
     plan: list[Any] = Field(default_factory=list)
     next_action: str | None = None
@@ -161,22 +203,26 @@ class SafeStateResponse(BaseModel):
 
 
 class HistoryResponse(BaseModel):
+    tenant_id: str
     thread_id: str
     history: list[dict[str, Any]]
 
 
 class TraceResponse(BaseModel):
+    tenant_id: str
     thread_id: str
     events: list[dict[str, Any]]
 
 
 class MemoryListResponse(BaseModel):
+    tenant_id: str
     organization_id: str
     user_id: str
     preferences: dict[str, Any]
 
 
 class MemoryMutationResponse(BaseModel):
+    tenant_id: str
     organization_id: str
     user_id: str
     key: str
@@ -186,6 +232,7 @@ class MemoryMutationResponse(BaseModel):
 
 class ThreadRecord(BaseModel):
     thread_id: str
+    tenant_id: str
     user_id: str
     organization_id: str
     role: Role
@@ -205,12 +252,31 @@ class ThreadDirectory:
                 """
                 CREATE TABLE IF NOT EXISTS workbench_threads (
                     thread_id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
                     user_id TEXT NOT NULL,
                     organization_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
+            )
+            columns = {
+                str(row[1])
+                for row in self.connection.execute(
+                    "PRAGMA table_info(workbench_threads)"
+                ).fetchall()
+            }
+            if "tenant_id" not in columns:
+                self.connection.execute(
+                    "ALTER TABLE workbench_threads ADD COLUMN tenant_id TEXT"
+                )
+                self.connection.execute(
+                    "UPDATE workbench_threads SET tenant_id = organization_id "
+                    "WHERE tenant_id IS NULL OR tenant_id = ''"
+                )
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_workbench_threads_tenant "
+                "ON workbench_threads (tenant_id, thread_id)"
             )
 
     def create(self, request: ThreadCreateRequest) -> ThreadRecord:
@@ -219,20 +285,28 @@ class ThreadDirectory:
             self.connection.execute(
                 """
                 INSERT INTO workbench_threads
-                    (thread_id, user_id, organization_id, role)
-                VALUES (?, ?, ?, ?)
+                    (thread_id, tenant_id, user_id, organization_id, role)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (thread_id, request.user_id, request.organization_id, request.role),
+                (
+                    thread_id,
+                    request.tenant_id,
+                    request.user_id,
+                    request.organization_id,
+                    request.role,
+                ),
             )
-        return self.get(thread_id)
+        return self.get(thread_id, str(request.tenant_id))
 
-    def get(self, thread_id: str) -> ThreadRecord:
+    def get(self, thread_id: str, tenant_id: str) -> ThreadRecord:
+        if not tenant_id.strip():
+            raise KeyError(thread_id)
         row = self.connection.execute(
             """
-            SELECT thread_id, user_id, organization_id, role, created_at
-            FROM workbench_threads WHERE thread_id = ?
+            SELECT thread_id, tenant_id, user_id, organization_id, role, created_at
+            FROM workbench_threads WHERE thread_id = ? AND tenant_id = ?
             """,
-            (thread_id,),
+            (thread_id, tenant_id),
         ).fetchone()
         if row is None:
             raise KeyError(thread_id)
@@ -321,12 +395,14 @@ def safe_state_projection(state: AgentState | dict[str, Any]) -> dict[str, Any]:
     return {
         "thread_id": state.get("thread_id"),
         "run_id": state.get("run_id"),
+        "tenant_id": state.get("tenant_id", state.get("organization_id")),
         "user_id": state.get("user_id"),
         "organization_id": state.get("organization_id"),
         "role": state.get("role"),
         "task": state.get("task"),
         "messages": messages,
         "conversation_summary": str(state.get("conversation_summary", ""))[:4_000],
+        "context_budget": redact_payload(state.get("context_budget", {})),
         "user_preferences": redact_payload(state.get("user_preferences", {})),
         "plan": redact_payload(state.get("plan", [])),
         "next_action": state.get("next_action"),
@@ -381,6 +457,16 @@ def _runtime_identity(
         "model_name": settings.model_name,
         "retriever_url": settings.retriever_url,
         "retriever_top_k": settings.retriever_top_k,
+        "context_budget": {
+            "total_context": settings.context_total_tokens,
+            "generation_reserve": settings.generation_reserve_tokens,
+            "safety_margin": settings.context_safety_margin_tokens,
+            "system": settings.system_context_budget,
+            "tool_catalog": settings.tool_catalog_context_budget,
+            "memory": settings.memory_context_budget,
+            "tool_results": settings.tool_results_context_budget,
+            "current_task": settings.current_task_context_budget,
+        },
     }
     runtime_fingerprint = hashlib.sha256(
         json.dumps(
@@ -398,6 +484,9 @@ def _runtime_identity(
             "url": _sanitized_endpoint(settings.retriever_url),
             "top_k": settings.retriever_top_k,
         },
+        "observability_enabled": settings.observability_enabled,
+        "otlp_export_configured": bool(settings.otlp_endpoint),
+        "context_budget": private_contract["context_budget"],
         "runtime_configuration_fingerprint": runtime_fingerprint,
     }
     return metadata, runtime_fingerprint
@@ -411,6 +500,9 @@ class WorkbenchService:
         *,
         graph: Any,
         registry: ToolRegistry,
+        tool_gateway: ToolGateway,
+        observability: RuntimeObservability,
+        mcp_adapter: MCPToolAdapter,
         memory_store: PreferenceMemoryStore,
         thread_directory: ThreadDirectory,
         settings: WorkbenchSettings,
@@ -419,6 +511,9 @@ class WorkbenchService:
     ) -> None:
         self.graph = graph
         self.registry = registry
+        self.tool_gateway = tool_gateway
+        self.observability = observability
+        self.mcp_adapter = mcp_adapter
         self.memory_store = memory_store
         self.thread_directory = thread_directory
         self.settings = settings
@@ -427,9 +522,16 @@ class WorkbenchService:
         self.channels: dict[str, RunChannel] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
 
-    def config(self, thread_id: str) -> dict[str, Any]:
+    def config(self, thread_id: str, tenant_id: str) -> dict[str, Any]:
+        if not tenant_id.strip():
+            raise ValueError("tenant_id is required for checkpoint access")
+        namespace = hashlib.sha256(
+            json.dumps(
+                [tenant_id, thread_id], separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+        ).hexdigest()
         return {
-            "configurable": {"thread_id": thread_id},
+            "configurable": {"thread_id": f"tenant-thread-{namespace}"},
             "recursion_limit": self.settings.max_graph_steps + 4,
         }
 
@@ -443,10 +545,11 @@ class WorkbenchService:
             )
 
     async def _publish_update(
-        self, channel: RunChannel, update: dict[str, Any]
+        self, tenant_id: str, channel: RunChannel, update: dict[str, Any]
     ) -> bool:
         interrupted = False
         for node, delta in update.items():
+            self.observability.counter("checkpoint.count", tenant_id=tenant_id)
             if node == "__interrupt__":
                 interrupts = delta if isinstance(delta, (tuple, list)) else [delta]
                 for item in interrupts:
@@ -500,17 +603,47 @@ class WorkbenchService:
                 )
         return interrupted
 
-    async def _drive(self, thread_id: str, graph_input: Any, channel: RunChannel) -> None:
+    async def _drive(
+        self, tenant_id: str, thread_id: str, graph_input: Any, channel: RunChannel
+    ) -> None:
+        started = time.perf_counter()
+        with self.observability.span(
+            "Agent Run",
+            {
+                "tenant.id": tenant_id,
+                "thread.id": thread_id,
+                "run.id": channel.run_id,
+            },
+        ):
+            outcome = await self._drive_inner(
+                tenant_id, thread_id, graph_input, channel
+            )
+        self.observability.observe(
+            "agent.run.latency",
+            max(0.0, time.perf_counter() - started),
+            tenant_id=tenant_id,
+        )
+        if outcome == "success":
+            self.observability.counter("run.success", tenant_id=tenant_id)
+        elif outcome == "failure":
+            self.observability.counter("run.failure", tenant_id=tenant_id)
+
+    async def _drive_inner(
+        self, tenant_id: str, thread_id: str, graph_input: Any, channel: RunChannel
+    ) -> str:
         interrupted = False
         try:
             async for update in self.graph.astream(
                 graph_input,
-                self.config(thread_id),
+                self.config(thread_id, tenant_id),
                 stream_mode="updates",
             ):
                 if isinstance(update, dict):
-                    interrupted = await self._publish_update(channel, update) or interrupted
-            snapshot = await self.graph.aget_state(self.config(thread_id))
+                    interrupted = (
+                        await self._publish_update(tenant_id, channel, update)
+                        or interrupted
+                    )
+            snapshot = await self.graph.aget_state(self.config(thread_id, tenant_id))
             safe_state = safe_state_projection(dict(snapshot.values or {}))
             if snapshot.next or interrupted:
                 await channel.publish(
@@ -522,6 +655,7 @@ class WorkbenchService:
                         "approval_request": safe_state.get("approval_request"),
                     },
                 )
+                return "paused"
             else:
                 await channel.publish(
                     "complete",
@@ -534,8 +668,11 @@ class WorkbenchService:
                         "termination_reason": safe_state.get("termination_reason"),
                     },
                 )
+                return "success" if safe_state["completed"] else "failure"
         except Exception as error:
-            safe_message = await self._record_runtime_failure(thread_id, error)
+            safe_message = await self._record_runtime_failure(
+                tenant_id, thread_id, error
+            )
             await channel.publish(
                 "error",
                 {
@@ -545,22 +682,24 @@ class WorkbenchService:
                     "message": safe_message,
                 },
             )
+            return "failure"
         finally:
             await channel.finish()
 
     async def _record_runtime_failure(
-        self, thread_id: str, error: Exception
+        self, tenant_id: str, thread_id: str, error: Exception
     ) -> str:
         redacted = redact_payload({"message": str(error)[:1_000]})
         safe_message = str(redacted.get("message", "runtime execution failed"))
         try:
-            snapshot = await self.graph.aget_state(self.config(thread_id))
+            snapshot = await self.graph.aget_state(self.config(thread_id, tenant_id))
             state = dict(snapshot.values or {})
             if not state:
                 return safe_message
             event = {
                 "sequence": len(state.get("execution_trace", [])),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "tenant_id": tenant_id,
                 "thread_id": str(state.get("thread_id", thread_id)),
                 "run_id": str(state.get("run_id", "unknown-run")),
                 "event_type": "run_failed",
@@ -574,7 +713,7 @@ class WorkbenchService:
                 "retry_number": 0,
             }
             await self.graph.aupdate_state(
-                self.config(thread_id),
+                self.config(thread_id, tenant_id),
                 {
                     "errors": [
                         {
@@ -595,12 +734,14 @@ class WorkbenchService:
             pass
         return safe_message
 
-    async def start_run(self, thread_id: str, task: str) -> tuple[str, RunChannel]:
-        record = self.thread_directory.get(thread_id)
+    async def start_run(
+        self, tenant_id: str, thread_id: str, task: str
+    ) -> tuple[str, RunChannel]:
+        record = self.thread_directory.get(thread_id, tenant_id)
         active = self.tasks.get(thread_id)
         if active is not None and not active.done():
             raise RuntimeError("thread already has an active graph segment")
-        snapshot = await self.graph.aget_state(self.config(thread_id))
+        snapshot = await self.graph.aget_state(self.config(thread_id, tenant_id))
         if snapshot.values:
             self._require_compatible_runtime(dict(snapshot.values))
         if snapshot.next:
@@ -611,12 +752,14 @@ class WorkbenchService:
                 "run_id": run_id,
                 "task": task,
                 "messages": [{"role": "user", "content": task}],
+                "context_budget": {},
                 "plan": [],
                 "next_action": None,
                 "action_arguments": {},
                 "pending_action": None,
                 "approval_request": None,
                 "approval_decision": None,
+                "approval_requested_at": None,
                 "step_count": 0,
                 "tool_call_count": 0,
                 "research_search_count": 0,
@@ -634,6 +777,7 @@ class WorkbenchService:
                 run_id=run_id,
                 user_id=record.user_id,
                 organization_id=record.organization_id,
+                tenant_id=record.tenant_id,
                 role=record.role,
                 task=task,
                 runtime_configuration_fingerprint=(
@@ -643,16 +787,17 @@ class WorkbenchService:
         channel = RunChannel(run_id=run_id)
         self.channels[thread_id] = channel
         self.tasks[thread_id] = asyncio.create_task(
-            self._drive(thread_id, graph_input, channel)
+            self._drive(tenant_id, thread_id, graph_input, channel)
         )
         return run_id, channel
 
     async def resume(self, thread_id: str, request: ResumeRequest) -> tuple[str, RunChannel]:
-        self.thread_directory.get(thread_id)
+        tenant_id = request.tenant_id
+        self.thread_directory.get(thread_id, tenant_id)
         active = self.tasks.get(thread_id)
         if active is not None and not active.done():
             raise RuntimeError("thread already has an active graph segment")
-        snapshot = await self.graph.aget_state(self.config(thread_id))
+        snapshot = await self.graph.aget_state(self.config(thread_id, tenant_id))
         if snapshot.values:
             self._require_compatible_runtime(dict(snapshot.values))
         if not snapshot.next or "human_approval_interrupt" not in snapshot.next:
@@ -678,11 +823,12 @@ class WorkbenchService:
                         f"approval edits cannot change {immutable_field}; "
                         "submit a new action instead"
                     )
-            policy = PolicyEngine(self.registry).evaluate(
-                state.get("role", "viewer"),
-                action,
-                validated,
-                {
+            policy = self.tool_gateway.evaluate_policy(
+                tenant_id=tenant_id,
+                role=state.get("role", "viewer"),
+                tool_name=action,
+                arguments=validated,
+                state_counts={
                     "tool_call_count": int(state.get("tool_call_count", 0)),
                     "max_tool_calls": self.settings.max_tool_calls,
                     "research_search_count": int(
@@ -698,10 +844,16 @@ class WorkbenchService:
         run_id = str((snapshot.values or {}).get("run_id", "")) or str(uuid.uuid4())
         channel = RunChannel(run_id=run_id)
         self.channels[thread_id] = channel
+        self.observability.counter("resume.count", tenant_id=tenant_id)
         self.tasks[thread_id] = asyncio.create_task(
             self._drive(
+                tenant_id,
                 thread_id,
-                Command(resume=request.model_dump(mode="json", exclude_none=True)),
+                Command(
+                    resume=request.model_dump(
+                        mode="json", exclude_none=True, exclude={"tenant_id"}
+                    )
+                ),
                 channel,
             )
         )
@@ -715,6 +867,7 @@ class WorkbenchService:
             await asyncio.gather(*pending, return_exceptions=True)
         self.memory_store.close()
         self.thread_directory.close()
+        self.observability.shutdown()
 
 
 def build_default_service(
@@ -724,6 +877,8 @@ def build_default_service(
     model_client: WorkbenchModelClient | None = None,
     tokenizer: Any | None = None,
     tokenizer_runtime: TokenizerRuntime | None = None,
+    tenant_tool_policy: TenantToolPolicy | None = None,
+    observability: RuntimeObservability | None = None,
 ) -> WorkbenchService:
     if tokenizer is not None and tokenizer_runtime is not None:
         raise ValueError("provide tokenizer or tokenizer_runtime, not both")
@@ -754,6 +909,30 @@ def build_default_service(
     registry = build_default_registry(
         enterprise_kb, research, analytics, campaign_api
     )
+    observability = observability or RuntimeObservability(
+        ObservabilityConfig(
+            enabled=settings.observability_enabled,
+            otlp_endpoint=settings.otlp_endpoint,
+        )
+    )
+    gateway = ToolGateway(
+        registry,
+        tenant_policy=tenant_tool_policy,
+        observability=observability,
+    )
+    budget_manager = ContextBudgetManager(
+        tokenizer,
+        ContextBudgetConfig(
+            total_context=settings.context_total_tokens,
+            generation_reserve=settings.generation_reserve_tokens,
+            safety_margin=settings.context_safety_margin_tokens,
+            system_budget=settings.system_context_budget,
+            tool_catalog_budget=settings.tool_catalog_context_budget,
+            memory_budget=settings.memory_context_budget,
+            tool_results_budget=settings.tool_results_context_budget,
+            current_task_budget=settings.current_task_context_budget,
+        ),
+    )
     memory_store = PreferenceMemoryStore(settings.memory_db_path)
     directory = ThreadDirectory(settings.memory_db_path)
     model_client = model_client or VLLMHTTPModelClient(
@@ -766,6 +945,9 @@ def build_default_service(
         registry=registry,
         memory_store=memory_store,
         settings=settings,
+        tool_gateway=gateway,
+        context_budget_manager=budget_manager,
+        observability=observability,
     ).build(checkpointer=checkpointer)
     runtime_metadata, runtime_fingerprint = _runtime_identity(
         settings, tokenizer_runtime
@@ -773,6 +955,9 @@ def build_default_service(
     return WorkbenchService(
         graph=graph,
         registry=registry,
+        tool_gateway=gateway,
+        observability=observability,
+        mcp_adapter=MCPToolAdapter(gateway),
         memory_store=memory_store,
         thread_directory=directory,
         settings=settings,
@@ -815,9 +1000,11 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
     def runtime(request: Request) -> WorkbenchService:
         return request.app.state.workbench
 
-    def thread_or_404(runtime_service: WorkbenchService, thread_id: str) -> ThreadRecord:
+    def thread_or_404(
+        runtime_service: WorkbenchService, thread_id: str, tenant_id: str
+    ) -> ThreadRecord:
         try:
-            return runtime_service.thread_directory.get(thread_id)
+            return runtime_service.thread_directory.get(thread_id, tenant_id)
         except KeyError as error:
             raise HTTPException(status_code=404, detail="thread not found") from error
 
@@ -834,9 +1021,53 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
             **runtime_service.runtime_metadata,
         )
 
+    @app.get("/metrics")
+    async def metrics(request: Request) -> Response:
+        return Response(
+            content=runtime(request).observability.prometheus_text(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
     @app.get("/api/tools", response_model=ToolsResponse)
-    async def tools(request: Request) -> ToolsResponse:
-        return ToolsResponse(tools=runtime(request).registry.safe_metadata())
+    async def tools(
+        request: Request,
+        tenant_id: str = Query(min_length=1, max_length=200),
+        role: Role = Query(),
+    ) -> ToolsResponse:
+        return ToolsResponse(
+            tools=runtime(request).tool_gateway.list_tools(tenant_id, role)
+        )
+
+    @app.get("/api/mcp/tools")
+    async def mcp_tools(
+        request: Request,
+        tenant_id: str = Query(min_length=1, max_length=200),
+        role: Role = Query(),
+    ) -> dict[str, Any]:
+        return runtime(request).mcp_adapter.list_tools(
+            tenant_id=tenant_id, role=role
+        )
+
+    @app.post("/api/mcp/call")
+    async def mcp_call(
+        payload: MCPCallRequest, request: Request
+    ) -> dict[str, Any]:
+        context = ToolInvocationContext(
+            tenant_id=payload.tenant_id,
+            user_id=payload.user_id,
+            role=payload.role,
+            thread_id=payload.thread_id,
+            run_id=payload.run_id,
+        )
+        try:
+            return await runtime(request).mcp_adapter.call_tool(
+                payload.name,
+                payload.arguments,
+                context=context,
+                version=payload.version,
+            )
+        except (KeyError, ToolAccessDenied, ValidationError, ValueError) as error:
+            raise HTTPException(status_code=403, detail="MCP tool call denied") from error
 
     @app.post("/api/threads", status_code=201, response_model=ThreadRecord)
     async def create_thread(
@@ -854,25 +1085,35 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
         thread_id: str, payload: RunCreateRequest, request: Request
     ) -> RunAcceptedResponse:
         runtime_service = runtime(request)
-        thread_or_404(runtime_service, thread_id)
+        thread_or_404(runtime_service, thread_id, payload.tenant_id)
         try:
-            run_id, _ = await runtime_service.start_run(thread_id, payload.task)
+            run_id, _ = await runtime_service.start_run(
+                payload.tenant_id, thread_id, payload.task
+            )
         except RuntimeError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except ValueError as error:
             detail = redact_payload({"message": str(error)})["message"]
             raise HTTPException(status_code=422, detail=detail) from error
         return RunAcceptedResponse(
+            tenant_id=payload.tenant_id,
             thread_id=thread_id,
             run_id=run_id,
             status="started",
-            stream_url=f"/api/threads/{thread_id}/stream",
+            stream_url=(
+                f"/api/threads/{thread_id}/stream?tenant_id="
+                f"{quote(payload.tenant_id, safe='')}"
+            ),
         )
 
     @app.get("/api/threads/{thread_id}/stream")
-    async def stream(thread_id: str, request: Request) -> StreamingResponse:
+    async def stream(
+        thread_id: str,
+        request: Request,
+        tenant_id: str = Query(min_length=1, max_length=200),
+    ) -> StreamingResponse:
         runtime_service = runtime(request)
-        thread_or_404(runtime_service, thread_id)
+        thread_or_404(runtime_service, thread_id, tenant_id)
         channel = runtime_service.channels.get(thread_id)
         if channel is None:
             raise HTTPException(status_code=404, detail="thread has no run stream")
@@ -891,27 +1132,38 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
         )
 
     @app.get("/api/threads/{thread_id}/state", response_model=SafeStateResponse)
-    async def state(thread_id: str, request: Request) -> SafeStateResponse:
+    async def state(
+        thread_id: str,
+        request: Request,
+        tenant_id: str = Query(min_length=1, max_length=200),
+    ) -> SafeStateResponse:
         runtime_service = runtime(request)
-        thread_or_404(runtime_service, thread_id)
+        thread_or_404(runtime_service, thread_id, tenant_id)
         snapshot = await runtime_service.graph.aget_state(
-            runtime_service.config(thread_id)
+            runtime_service.config(thread_id, tenant_id)
         )
         if not snapshot.values:
             return SafeStateResponse(
-                thread_id=thread_id, status="created", completed=False
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                status="created",
+                completed=False,
             )
         return SafeStateResponse.model_validate(
             safe_state_projection(dict(snapshot.values))
         )
 
     @app.get("/api/threads/{thread_id}/history", response_model=HistoryResponse)
-    async def history(thread_id: str, request: Request) -> HistoryResponse:
+    async def history(
+        thread_id: str,
+        request: Request,
+        tenant_id: str = Query(min_length=1, max_length=200),
+    ) -> HistoryResponse:
         runtime_service = runtime(request)
-        thread_or_404(runtime_service, thread_id)
+        thread_or_404(runtime_service, thread_id, tenant_id)
         records = []
         async for snapshot in runtime_service.graph.aget_state_history(
-            runtime_service.config(thread_id), limit=50
+            runtime_service.config(thread_id, tenant_id), limit=50
         ):
             values = dict(snapshot.values or {})
             records.append(
@@ -928,14 +1180,20 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
                     "termination_reason": values.get("termination_reason"),
                 }
             )
-        return HistoryResponse(thread_id=thread_id, history=records)
+        return HistoryResponse(
+            tenant_id=tenant_id, thread_id=thread_id, history=records
+        )
 
     @app.get("/api/threads/{thread_id}/trace", response_model=TraceResponse)
-    async def trace(thread_id: str, request: Request) -> TraceResponse:
+    async def trace(
+        thread_id: str,
+        request: Request,
+        tenant_id: str = Query(min_length=1, max_length=200),
+    ) -> TraceResponse:
         runtime_service = runtime(request)
-        thread_or_404(runtime_service, thread_id)
+        thread_or_404(runtime_service, thread_id, tenant_id)
         snapshot = await runtime_service.graph.aget_state(
-            runtime_service.config(thread_id)
+            runtime_service.config(thread_id, tenant_id)
         )
         raw_events = (snapshot.values or {}).get("execution_trace", [])
         events = [
@@ -943,7 +1201,7 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
             for event in raw_events[-500:]
             if isinstance(event, dict)
         ]
-        return TraceResponse(thread_id=thread_id, events=events)
+        return TraceResponse(tenant_id=tenant_id, thread_id=thread_id, events=events)
 
     @app.post(
         "/api/threads/{thread_id}/resume",
@@ -954,7 +1212,7 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
         thread_id: str, payload: ResumeRequest, request: Request
     ) -> ResumeAcceptedResponse:
         runtime_service = runtime(request)
-        thread_or_404(runtime_service, thread_id)
+        thread_or_404(runtime_service, thread_id, payload.tenant_id)
         try:
             run_id, _ = await runtime_service.resume(thread_id, payload)
         except RuntimeError as error:
@@ -963,11 +1221,15 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
             detail = redact_payload({"message": str(error)})["message"]
             raise HTTPException(status_code=422, detail=detail) from error
         return ResumeAcceptedResponse(
+            tenant_id=payload.tenant_id,
             thread_id=thread_id,
             run_id=run_id,
             status="resumed",
             decision=payload.decision,
-            stream_url=f"/api/threads/{thread_id}/stream",
+            stream_url=(
+                f"/api/threads/{thread_id}/stream?tenant_id="
+                f"{quote(payload.tenant_id, safe='')}"
+            ),
         )
 
     @app.get(
@@ -976,13 +1238,14 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
     async def memories(
         user_id: str,
         request: Request,
-        organization_id: str = Query(min_length=1, max_length=200),
+        tenant_id: str = Query(min_length=1, max_length=200),
     ) -> MemoryListResponse:
         values = runtime(request).memory_store.list_preferences(
-            organization_id, user_id
+            tenant_id, user_id
         )
         return MemoryListResponse(
-            organization_id=organization_id,
+            tenant_id=tenant_id,
+            organization_id=tenant_id,
             user_id=user_id,
             preferences=values,
         )
@@ -999,12 +1262,13 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
     ) -> MemoryMutationResponse:
         try:
             runtime(request).memory_store.set_preference(
-                payload.organization_id, user_id, key, payload.value
+                payload.tenant_id, user_id, key, payload.value
             )
         except MemoryValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         return MemoryMutationResponse(
-            organization_id=payload.organization_id,
+            tenant_id=payload.tenant_id,
+            organization_id=payload.tenant_id,
             user_id=user_id,
             key=key,
             stored=True,
@@ -1018,13 +1282,14 @@ def create_app(service: WorkbenchService | None = None) -> FastAPI:
         user_id: str,
         key: str,
         request: Request,
-        organization_id: str = Query(min_length=1, max_length=200),
+        tenant_id: str = Query(min_length=1, max_length=200),
     ) -> MemoryMutationResponse:
         deleted = runtime(request).memory_store.delete_preference(
-            organization_id, user_id, key
+            tenant_id, user_id, key
         )
         return MemoryMutationResponse(
-            organization_id=organization_id,
+            tenant_id=tenant_id,
+            organization_id=tenant_id,
             user_id=user_id,
             key=key,
             deleted=deleted,

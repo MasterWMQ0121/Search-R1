@@ -77,7 +77,9 @@ async def test_api_validates_projects_state_and_streams_sse(tmp_path):
             assert health.json()["model_process"] == "external"
             assert health.json()["tokenizer_mode"] == "approximate_test"
             assert len(health.json()["runtime_configuration_fingerprint"]) == 64
-            tools = await client.get("/api/tools")
+            tools = await client.get(
+                "/api/tools", params={"tenant_id": "o", "role": "analyst"}
+            )
             assert tools.status_code == 200
             assert any(item["name"] == "get_campaign" for item in tools.json()["tools"])
 
@@ -92,44 +94,70 @@ async def test_api_validates_projects_state_and_streams_sse(tmp_path):
             )
             thread_id = created.json()["thread_id"]
             started = await client.post(
-                f"/api/threads/{thread_id}/runs", json={"task": "Show C102."}
+                f"/api/threads/{thread_id}/runs",
+                json={"tenant_id": "o", "task": "Show C102."},
             )
             assert started.status_code == 202
-            streamed = await client.get(f"/api/threads/{thread_id}/stream")
+            streamed = await client.get(
+                f"/api/threads/{thread_id}/stream", params={"tenant_id": "o"}
+            )
             assert streamed.headers["content-type"].startswith("text/event-stream")
             events = sse_payloads(streamed.text)
             assert any(item.get("user_visible_reason") for item in events)
             assert any(item.get("event_type") == "tool_completed" for item in events)
             assert any(item.get("event_type") == "run_completed" for item in events)
+            metrics = await client.get("/metrics")
+            assert metrics.status_code == 200
+            assert "workbench_agent_run_latency" in metrics.text
+            assert "workbench_tool_calls" in metrics.text
+            assert "workbench_context_tokens" in metrics.text
+            spans = service.observability.span_records()
+            by_name = {item["name"]: item for item in spans}
+            assert by_name["Planner"]["parent"] == "Agent Run"
+            assert by_name["Tool/get_campaign"]["parent"] == "Agent Run"
+            assert by_name["Finalizer"]["parent"] == "Agent Run"
+            assert by_name["LLM/Planner"]["parent"] == "Planner"
 
-            state = (await client.get(f"/api/threads/{thread_id}/state")).json()
+            state = (
+                await client.get(
+                    f"/api/threads/{thread_id}/state", params={"tenant_id": "o"}
+                )
+            ).json()
             assert state["completed"] is True
             assert state["final_citations"] == ["BUSINESS:C102:get_campaign"]
             assert "execution_trace" not in state
             assert "document_path" not in json.dumps(state["sources"])
-            history = (await client.get(f"/api/threads/{thread_id}/history")).json()
+            history = (
+                await client.get(
+                    f"/api/threads/{thread_id}/history", params={"tenant_id": "o"}
+                )
+            ).json()
             assert history["history"]
-            trace = (await client.get(f"/api/threads/{thread_id}/trace")).json()
+            trace = (
+                await client.get(
+                    f"/api/threads/{thread_id}/trace", params={"tenant_id": "o"}
+                )
+            ).json()
             assert trace["events"]
             assert "chain_of_thought" not in json.dumps(trace).lower()
 
             stored = await client.put(
                 "/api/users/u/memories/preferred_kpi",
-                json={"organization_id": "o", "value": "ROI"},
+                json={"tenant_id": "o", "value": "ROI"},
             )
             assert stored.status_code == 200
             memories = await client.get(
-                "/api/users/u/memories", params={"organization_id": "o"}
+                "/api/users/u/memories", params={"tenant_id": "o"}
             )
             assert memories.json()["preferences"] == {"preferred_kpi": "ROI"}
             rejected = await client.put(
                 "/api/users/u/memories/api_token",
-                json={"organization_id": "o", "value": "secret"},
+                json={"tenant_id": "o", "value": "secret"},
             )
             assert rejected.status_code == 422
             deleted = await client.delete(
                 "/api/users/u/memories/preferred_kpi",
-                params={"organization_id": "o"},
+                params={"tenant_id": "o"},
             )
             assert deleted.json()["deleted"] is True
     finally:
@@ -205,11 +233,17 @@ async def test_api_interrupt_and_same_thread_resume(tmp_path):
             thread_id = created.json()["thread_id"]
             await client.post(
                 f"/api/threads/{thread_id}/runs",
-                json={"task": "Increase C102 budget to 1200."},
+                json={"tenant_id": "org", "task": "Increase C102 budget to 1200."},
             )
-            first_stream = await client.get(f"/api/threads/{thread_id}/stream")
+            first_stream = await client.get(
+                f"/api/threads/{thread_id}/stream", params={"tenant_id": "org"}
+            )
             assert "approval_request" in first_stream.text
-            paused_state = (await client.get(f"/api/threads/{thread_id}/state")).json()
+            paused_state = (
+                await client.get(
+                    f"/api/threads/{thread_id}/state", params={"tenant_id": "org"}
+                )
+            ).json()
             assert paused_state["approval_request"]["action"] == "update_campaign_budget"
             generated_key = paused_state["pending_action"]["arguments"][
                 "idempotency_key"
@@ -225,11 +259,14 @@ async def test_api_interrupt_and_same_thread_resume(tmp_path):
                 ).fetchone()[0] == 1000.0
 
             resumed = await client.post(
-                f"/api/threads/{thread_id}/resume", json={"decision": "approve"}
+                f"/api/threads/{thread_id}/resume",
+                json={"tenant_id": "org", "decision": "approve"},
             )
             assert resumed.status_code == 202
             assert resumed.json()["thread_id"] == thread_id
-            second_stream = await client.get(f"/api/threads/{thread_id}/stream")
+            second_stream = await client.get(
+                f"/api/threads/{thread_id}/stream", params={"tenant_id": "org"}
+            )
             assert "run_completed" in second_stream.text
             with sqlite3.connect(service.settings.business_db_path) as connection:
                 assert connection.execute(
@@ -281,9 +318,11 @@ async def test_tokenizer_runtime_mismatch_rejects_approval_resume(tmp_path):
             thread_id = created.json()["thread_id"]
             await client.post(
                 f"/api/threads/{thread_id}/runs",
-                json={"task": "Increase C102 budget."},
+                json={"tenant_id": "org", "task": "Increase C102 budget."},
             )
-            await client.get(f"/api/threads/{thread_id}/stream")
+            await client.get(
+                f"/api/threads/{thread_id}/stream", params={"tenant_id": "org"}
+            )
 
             changed_runtime = replace(
                 original_runtime, artifact_fingerprint="b" * 64
@@ -292,7 +331,8 @@ async def test_tokenizer_runtime_mismatch_rejects_approval_resume(tmp_path):
                 service.settings, changed_runtime
             )
             response = await client.post(
-                f"/api/threads/{thread_id}/resume", json={"decision": "approve"}
+                f"/api/threads/{thread_id}/resume",
+                json={"tenant_id": "org", "decision": "approve"},
             )
 
             assert response.status_code == 409
@@ -339,10 +379,16 @@ async def test_api_rejects_approval_edit_that_changes_target(tmp_path):
             thread_id = created.json()["thread_id"]
             await client.post(
                 f"/api/threads/{thread_id}/runs",
-                json={"task": "Increase C102 budget."},
+                json={"tenant_id": "org", "task": "Increase C102 budget."},
             )
-            await client.get(f"/api/threads/{thread_id}/stream")
-            paused = (await client.get(f"/api/threads/{thread_id}/state")).json()
+            await client.get(
+                f"/api/threads/{thread_id}/stream", params={"tenant_id": "org"}
+            )
+            paused = (
+                await client.get(
+                    f"/api/threads/{thread_id}/state", params={"tenant_id": "org"}
+                )
+            ).json()
             generated_key = paused["pending_action"]["arguments"][
                 "idempotency_key"
             ]
@@ -350,6 +396,7 @@ async def test_api_rejects_approval_edit_that_changes_target(tmp_path):
             response = await client.post(
                 f"/api/threads/{thread_id}/resume",
                 json={
+                    "tenant_id": "org",
                     "decision": "edit",
                     "edited_arguments": {
                         "campaign_id": "C101",
@@ -360,7 +407,11 @@ async def test_api_rejects_approval_edit_that_changes_target(tmp_path):
             )
 
             assert response.status_code == 422
-            state = (await client.get(f"/api/threads/{thread_id}/state")).json()
+            state = (
+                await client.get(
+                    f"/api/threads/{thread_id}/state", params={"tenant_id": "org"}
+                )
+            ).json()
             assert state["approval_request"]["action"] == "update_campaign_budget"
             with sqlite3.connect(service.settings.business_db_path) as connection:
                 assert connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 0
@@ -384,20 +435,31 @@ async def test_runtime_failure_is_redacted_and_durably_checkpointed(tmp_path):
             )
             thread_id = created.json()["thread_id"]
             await client.post(
-                f"/api/threads/{thread_id}/runs", json={"task": "Summarize safely."}
+                f"/api/threads/{thread_id}/runs",
+                json={"tenant_id": "o", "task": "Summarize safely."},
             )
-            await client.get(f"/api/threads/{thread_id}/stream")
+            await client.get(
+                f"/api/threads/{thread_id}/stream", params={"tenant_id": "o"}
+            )
 
             safe_message = await service._record_runtime_failure(
-                thread_id, RuntimeError("backend api_key=do-not-leak failed")
+                "o", thread_id, RuntimeError("backend api_key=do-not-leak failed")
             )
 
             assert "do-not-leak" not in safe_message
-            state = (await client.get(f"/api/threads/{thread_id}/state")).json()
+            state = (
+                await client.get(
+                    f"/api/threads/{thread_id}/state", params={"tenant_id": "o"}
+                )
+            ).json()
             assert state["termination_reason"] == "runtime_error"
             assert state["errors"][-1]["code"] == "runtime_error"
             assert "do-not-leak" not in json.dumps(state)
-            trace = (await client.get(f"/api/threads/{thread_id}/trace")).json()
+            trace = (
+                await client.get(
+                    f"/api/threads/{thread_id}/trace", params={"tenant_id": "o"}
+                )
+            ).json()
             assert trace["events"][-1]["event_type"] == "run_failed"
     finally:
         await service.shutdown()

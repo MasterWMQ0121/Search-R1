@@ -19,6 +19,7 @@ class AgentState(TypedDict, total=False):
 
     thread_id: str
     run_id: str
+    tenant_id: str
     user_id: str
     organization_id: str
     role: Role
@@ -26,6 +27,7 @@ class AgentState(TypedDict, total=False):
     task: str
     messages: Annotated[list[dict[str, Any]], operator.add]
     conversation_summary: str
+    context_budget: dict[str, Any]
     user_preferences: dict[str, Any]
     plan: list[dict[str, Any]]
     next_action: str | None
@@ -36,6 +38,7 @@ class AgentState(TypedDict, total=False):
     execution_trace: Annotated[list[dict[str, Any]], operator.add]
     approval_request: dict[str, Any] | None
     approval_decision: dict[str, Any] | None
+    approval_requested_at: str | None
     step_count: int
     tool_call_count: int
     research_search_count: int
@@ -57,6 +60,7 @@ def initial_agent_state(
     run_id: str,
     user_id: str,
     organization_id: str,
+    tenant_id: str | None = None,
     role: Role,
     task: str,
     user_preferences: dict[str, Any] | None = None,
@@ -64,9 +68,13 @@ def initial_agent_state(
 ) -> AgentState:
     """Return a complete initial state containing only checkpoint-safe values."""
 
+    canonical_tenant = (tenant_id or organization_id).strip()
+    if tenant_id is not None and organization_id.strip() != canonical_tenant:
+        raise ValueError("tenant_id and organization_id must identify the same tenant")
     required = {
         "thread_id": thread_id,
         "run_id": run_id,
+        "tenant_id": canonical_tenant,
         "user_id": user_id,
         "organization_id": organization_id,
         "task": task,
@@ -78,6 +86,7 @@ def initial_agent_state(
     return {
         "thread_id": thread_id,
         "run_id": run_id,
+        "tenant_id": canonical_tenant,
         "user_id": user_id,
         "organization_id": organization_id,
         "role": role,
@@ -85,6 +94,7 @@ def initial_agent_state(
         "task": task,
         "messages": [{"role": "user", "content": task}],
         "conversation_summary": "",
+        "context_budget": {},
         "user_preferences": dict(user_preferences or {}),
         "plan": [],
         "next_action": None,
@@ -95,6 +105,7 @@ def initial_agent_state(
         "execution_trace": [],
         "approval_request": None,
         "approval_decision": None,
+        "approval_requested_at": None,
         "step_count": 0,
         "tool_call_count": 0,
         "research_search_count": 0,

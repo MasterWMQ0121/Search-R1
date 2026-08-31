@@ -24,6 +24,13 @@ def _positive_float(name: str, default: float) -> float:
     return value
 
 
+def _nonnegative_int(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
 def _boolean(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -54,6 +61,16 @@ class WorkbenchSettings:
     max_planner_repairs: int
     tool_timeout_seconds: float
     summary_message_threshold: int
+    observability_enabled: bool
+    otlp_endpoint: str | None
+    context_total_tokens: int
+    generation_reserve_tokens: int
+    context_safety_margin_tokens: int
+    system_context_budget: int
+    tool_catalog_context_budget: int
+    memory_context_budget: int
+    tool_results_context_budget: int
+    current_task_context_budget: int
 
     @property
     def checkpoint_path(self) -> Path:
@@ -108,6 +125,30 @@ class WorkbenchSettings:
             ),
             summary_message_threshold=_positive_int(
                 "WORKBENCH_SUMMARY_MESSAGE_THRESHOLD", 12
+            ),
+            observability_enabled=_boolean("WORKBENCH_OBSERVABILITY_ENABLED", True),
+            otlp_endpoint=(os.getenv("WORKBENCH_OTLP_ENDPOINT", "").strip() or None),
+            context_total_tokens=_positive_int("WORKBENCH_CONTEXT_TOKENS", 8192),
+            generation_reserve_tokens=_nonnegative_int(
+                "WORKBENCH_GENERATION_RESERVE_TOKENS", 700
+            ),
+            context_safety_margin_tokens=_nonnegative_int(
+                "WORKBENCH_CONTEXT_SAFETY_MARGIN_TOKENS", 256
+            ),
+            system_context_budget=_nonnegative_int(
+                "WORKBENCH_SYSTEM_CONTEXT_BUDGET", 800
+            ),
+            tool_catalog_context_budget=_nonnegative_int(
+                "WORKBENCH_TOOL_CATALOG_CONTEXT_BUDGET", 1800
+            ),
+            memory_context_budget=_nonnegative_int(
+                "WORKBENCH_MEMORY_CONTEXT_BUDGET", 800
+            ),
+            tool_results_context_budget=_nonnegative_int(
+                "WORKBENCH_TOOL_RESULTS_CONTEXT_BUDGET", 2000
+            ),
+            current_task_context_budget=_nonnegative_int(
+                "WORKBENCH_CURRENT_TASK_CONTEXT_BUDGET", 500
             ),
         )
 

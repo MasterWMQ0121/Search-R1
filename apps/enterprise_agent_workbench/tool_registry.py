@@ -115,6 +115,18 @@ def _concise_argument_error(error: ValidationError) -> str:
 
 
 @dataclass(frozen=True)
+class RateLimitConfig:
+    capacity: int
+    refill_per_second: float
+
+    def __post_init__(self) -> None:
+        if self.capacity <= 0:
+            raise ValueError("rate-limit capacity must be positive")
+        if self.refill_per_second <= 0:
+            raise ValueError("rate-limit refill_per_second must be positive")
+
+
+@dataclass(frozen=True)
 class ToolSpec:
     name: str
     description: str
@@ -132,6 +144,9 @@ class ToolSpec:
     enabled: bool
     handler: Handler
     planner_description: str | None = None
+    version: str = "v1"
+    rate_limit: RateLimitConfig | None = None
+    max_retries: int = 0
 
     @property
     def input_schema(self) -> type[BaseModel]:
@@ -152,10 +167,15 @@ class ToolSpec:
             raise ValueError(f"side-effecting tool {self.name!r} must be idempotent")
         if self.timeout_seconds <= 0:
             raise ValueError(f"tool {self.name!r} timeout must be positive")
+        if not self.version.strip():
+            raise ValueError(f"tool {self.name!r} version must be non-empty")
+        if self.max_retries < 0:
+            raise ValueError(f"tool {self.name!r} max_retries must be non-negative")
 
     def safe_metadata(self) -> dict[str, Any]:
         return {
             "name": self.name,
+            "version": self.version,
             "description": self.description,
             "input_schema": self.input_model.model_json_schema(),
             "output_schema": self.output_model.model_json_schema(),
@@ -169,6 +189,15 @@ class ToolSpec:
             "idempotent": self.idempotent,
             "source_producing": self.source_producing,
             "enabled": self.enabled,
+            "rate_limit": (
+                None
+                if self.rate_limit is None
+                else {
+                    "capacity": self.rate_limit.capacity,
+                    "refill_per_second": self.rate_limit.refill_per_second,
+                }
+            ),
+            "max_retries": self.max_retries,
         }
 
     def planner_metadata(self) -> dict[str, Any]:
@@ -385,6 +414,7 @@ def build_default_registry(
             True,
             enterprise_kb.search,
             planner_description=_PLANNER_DESCRIPTIONS["enterprise_kb_search"],
+            rate_limit=RateLimitConfig(capacity=60, refill_per_second=10.0),
         ),
         ToolSpec(
             "research_search",
@@ -403,6 +433,8 @@ def build_default_registry(
             True,
             research_search.search,
             planner_description=_PLANNER_DESCRIPTIONS["research_search"],
+            rate_limit=RateLimitConfig(capacity=30, refill_per_second=5.0),
+            max_retries=1,
         ),
     ]
     analytics_inputs = {
@@ -432,6 +464,7 @@ def build_default_registry(
                 True,
                 partial(_analytics_handler, merchant_analytics, name),
                 planner_description=_PLANNER_DESCRIPTIONS[name],
+                rate_limit=RateLimitConfig(capacity=60, refill_per_second=10.0),
             )
         )
     read_specs = {
@@ -461,6 +494,7 @@ def build_default_registry(
                 True,
                 partial(_campaign_read_handler, campaign_api, name),
                 planner_description=_PLANNER_DESCRIPTIONS[name],
+                rate_limit=RateLimitConfig(capacity=60, refill_per_second=10.0),
             )
         )
     write_inputs = {
@@ -488,6 +522,18 @@ def build_default_registry(
                 True,
                 partial(_campaign_write_handler, campaign_api, name),
                 planner_description=_PLANNER_DESCRIPTIONS[name],
+                rate_limit=RateLimitConfig(capacity=10, refill_per_second=0.2),
             )
         )
     return ToolRegistry(specs)
+
+
+__all__ = [
+    "ALL_ROLES",
+    "ANALYST_ROLES",
+    "WRITE_ROLES",
+    "RateLimitConfig",
+    "ToolRegistry",
+    "ToolSpec",
+    "build_default_registry",
+]

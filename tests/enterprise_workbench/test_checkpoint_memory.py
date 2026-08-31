@@ -73,9 +73,9 @@ async def test_sqlite_checkpoint_persists_and_isolates_threads(tmp_path):
             )
         )
         thread_id = record.thread_id
-        await service.start_run(thread_id, "Show campaign C102.")
+        await service.start_run("org-a", thread_id, "Show campaign C102.")
         await service.tasks[thread_id]
-        snapshot = await service.graph.aget_state(service.config(thread_id))
+        snapshot = await service.graph.aget_state(service.config(thread_id, "org-a"))
         assert snapshot.values["completed"] is True
         await service.shutdown()
 
@@ -89,8 +89,10 @@ async def test_sqlite_checkpoint_persists_and_isolates_threads(tmp_path):
             model_client=FakeModelClient(),
             tokenizer=DeterministicTextTokenizer(),
         )
-        assert reopened.thread_directory.get(thread_id).user_id == "user-a"
-        persisted = await reopened.graph.aget_state(reopened.config(thread_id))
+        assert reopened.thread_directory.get(thread_id, "org-a").user_id == "user-a"
+        persisted = await reopened.graph.aget_state(
+            reopened.config(thread_id, "org-a")
+        )
         assert persisted.values["final_answer"].startswith("Campaign C102")
 
         isolated = reopened.thread_directory.create(
@@ -98,6 +100,8 @@ async def test_sqlite_checkpoint_persists_and_isolates_threads(tmp_path):
                 user_id="user-b", organization_id="org-a", role="viewer"
             )
         )
-        empty = await reopened.graph.aget_state(reopened.config(isolated.thread_id))
+        empty = await reopened.graph.aget_state(
+            reopened.config(isolated.thread_id, "org-a")
+        )
         assert not empty.values
         await reopened.shutdown()

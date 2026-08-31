@@ -54,6 +54,7 @@ def demo_database(tmp_path):
 
 def _context(decision="approve"):
     return BusinessExecutionContext(
+        tenant_id="tenant-1",
         thread_id="thread-1",
         user_id="operator-1",
         role="operator",

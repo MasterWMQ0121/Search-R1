@@ -235,6 +235,7 @@ class LiveWorkbenchClient:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
         self.client = httpx.Client(base_url=self.base_url, timeout=timeout_seconds)
+        self._thread_tenants: dict[str, str] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -248,7 +249,9 @@ class LiveWorkbenchClient:
         return payload
 
     def tool_categories(self) -> dict[str, str]:
-        response = self.client.get("/api/tools")
+        response = self.client.get(
+            "/api/tools", params={"tenant_id": "evaluation", "role": "admin"}
+        )
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
@@ -265,7 +268,9 @@ class LiveWorkbenchClient:
         """Return stable, public server metadata safe to bind into a run."""
 
         health = self._object(self.client.get("/healthz"), "health check")
-        response = self.client.get("/api/tools")
+        response = self.client.get(
+            "/api/tools", params={"tenant_id": "evaluation", "role": "admin"}
+        )
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
@@ -277,31 +282,52 @@ class LiveWorkbenchClient:
         return {"health": health, "tools": tools}
 
     def create_thread(self, identity: Mapping[str, Any]) -> str:
+        tenant_id = str(
+            identity.get("tenant_id") or identity.get("organization_id") or ""
+        )
+        if not tenant_id:
+            raise ValueError("evaluation identity requires tenant_id")
+        request_identity = {
+            **dict(identity),
+            "tenant_id": tenant_id,
+            "organization_id": tenant_id,
+        }
         payload = self._object(
-            self.client.post("/api/threads", json=dict(identity)), "create thread"
+            self.client.post("/api/threads", json=request_identity), "create thread"
         )
         thread_id = payload.get("thread_id")
         if thread_id is None and isinstance(payload.get("thread"), dict):
             thread_id = payload["thread"].get("thread_id")
         if not isinstance(thread_id, str) or not thread_id:
             raise RuntimeError("create thread response has no thread_id")
+        self._thread_tenants[thread_id] = tenant_id
         return thread_id
 
     def start_run(self, thread_id: str, task: str) -> dict[str, Any]:
         return self._object(
-            self.client.post(f"/api/threads/{thread_id}/runs", json={"task": task}),
+            self.client.post(
+                f"/api/threads/{thread_id}/runs",
+                json={"tenant_id": self._thread_tenants[thread_id], "task": task},
+            ),
             "start run",
         )
 
     def state(self, thread_id: str) -> dict[str, Any]:
         payload = self._object(
-            self.client.get(f"/api/threads/{thread_id}/state"), "thread state"
+            self.client.get(
+                f"/api/threads/{thread_id}/state",
+                params={"tenant_id": self._thread_tenants[thread_id]},
+            ),
+            "thread state",
         )
         nested = payload.get("state")
         return dict(nested) if isinstance(nested, dict) else payload
 
     def trace(self, thread_id: str) -> list[dict[str, Any]]:
-        response = self.client.get(f"/api/threads/{thread_id}/trace")
+        response = self.client.get(
+            f"/api/threads/{thread_id}/trace",
+            params={"tenant_id": self._thread_tenants[thread_id]},
+        )
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
@@ -312,7 +338,13 @@ class LiveWorkbenchClient:
 
     def resume(self, thread_id: str, decision: Mapping[str, Any]) -> dict[str, Any]:
         return self._object(
-            self.client.post(f"/api/threads/{thread_id}/resume", json=dict(decision)),
+            self.client.post(
+                f"/api/threads/{thread_id}/resume",
+                json={
+                    **dict(decision),
+                    "tenant_id": self._thread_tenants[thread_id],
+                },
+            ),
             "resume run",
         )
 

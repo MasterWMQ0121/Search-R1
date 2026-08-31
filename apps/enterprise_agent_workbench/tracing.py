@@ -82,6 +82,7 @@ class TraceEvent(BaseModel):
     sequence: int = Field(ge=0)
     timestamp: str
     event_type: TraceEventType
+    tenant_id: str = Field(min_length=1)
     thread_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)
     node: str | None = None
@@ -97,9 +98,12 @@ class TraceEvent(BaseModel):
 class ExecutionTrace:
     """Thread-safe in-process collector whose exported events are primitives."""
 
-    def __init__(self, *, thread_id: str, run_id: str) -> None:
-        if not thread_id.strip() or not run_id.strip():
-            raise ValueError("thread_id and run_id must be non-empty")
+    def __init__(
+        self, *, thread_id: str, run_id: str, tenant_id: str = "default"
+    ) -> None:
+        if not thread_id.strip() or not run_id.strip() or not tenant_id.strip():
+            raise ValueError("tenant_id, thread_id and run_id must be non-empty")
+        self.tenant_id = tenant_id
         self.thread_id = thread_id
         self.run_id = run_id
         self._events: list[TraceEvent] = []
@@ -123,6 +127,7 @@ class ExecutionTrace:
                 sequence=len(self._events),
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 event_type=event_type,
+                tenant_id=self.tenant_id,
                 thread_id=self.thread_id,
                 run_id=self.run_id,
                 node=node,

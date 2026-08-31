@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+WORKBENCH_PYTHON="${WORKBENCH_PYTHON:-python3}"
+WORKBENCH_PYTHON_RESOLVED="$(command -v "${WORKBENCH_PYTHON}")"
+
+"${WORKBENCH_PYTHON_RESOLVED}" -c '
+import sys
+if sys.version_info < (3, 11):
+    raise SystemExit("agentctl requires Python 3.11 or newer")
+'
+
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+exec "${WORKBENCH_PYTHON_RESOLVED}" -m apps.enterprise_agent_workbench.cli "$@"

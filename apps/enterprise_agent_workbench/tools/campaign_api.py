@@ -75,6 +75,7 @@ class CreateFollowupTaskInput(_IdempotentCampaignInput):
 class BusinessExecutionContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    tenant_id: str = Field(min_length=1, max_length=200)
     thread_id: str = Field(min_length=1, max_length=200)
     user_id: str = Field(min_length=1, max_length=200)
     role: Literal["operator", "admin"]
@@ -178,6 +179,7 @@ CREATE TABLE orders (
 CREATE TABLE audit_log (
     event_id TEXT PRIMARY KEY,
     timestamp TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
     thread_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     action TEXT NOT NULL,
@@ -327,6 +329,16 @@ class CampaignAPI:
         self.database_path = Path(database_path).expanduser().resolve()
         if not self.database_path.is_file():
             raise FileNotFoundError(f"merchant database does not exist: {self.database_path}")
+        with self._connect() as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(audit_log)").fetchall()
+            }
+            if "tenant_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE audit_log ADD COLUMN tenant_id TEXT NOT NULL "
+                    "DEFAULT 'legacy'"
+                )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path, timeout=5.0)
@@ -506,12 +518,13 @@ class CampaignAPI:
             connection.execute(
                 """
                 INSERT INTO audit_log
-                    (event_id, timestamp, thread_id, user_id, action, payload, result)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (event_id, timestamp, tenant_id, thread_id, user_id, action, payload, result)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event_id,
                     timestamp,
+                    context.tenant_id,
                     context.thread_id,
                     context.user_id,
                     action,

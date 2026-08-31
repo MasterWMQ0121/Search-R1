@@ -184,10 +184,12 @@ use deterministic local SQLite fixtures.
 
 ## Tool Registry
 
-Every tool has an explicit Pydantic input and output model, category, risk,
-roles, timeout, read/write designation, approval flag, idempotency declaration,
-source-production flag, and enabled state. `GET /api/tools` returns only safe
-metadata.
+Every tool has an explicit Pydantic input and output model, version, category,
+risk, roles, timeout, retry/rate-limit configuration, read/write designation,
+approval flag, idempotency declaration, source-production flag, and enabled
+state. `GET /api/tools?tenant_id=...&role=...` returns only tenant-policy- and
+role-visible safe metadata. Graph nodes call tools only through `ToolGateway`;
+the Registry itself remains the protocol-neutral catalog.
 
 | Category | Tools | Side effect |
 |---|---|---|
@@ -338,7 +340,10 @@ reasoning tokens.
 | Method | Endpoint | Purpose |
 |---|---|---|
 | GET | `/healthz` | Readiness and safe configuration summary |
-| GET | `/api/tools` | Safe Tool Registry metadata |
+| GET | `/metrics` | Prometheus text exposition |
+| GET | `/api/tools?tenant_id=...&role=...` | Tenant/role-visible Tool Registry metadata |
+| GET | `/api/mcp/tools?tenant_id=...&role=...` | MCP-compatible read-only manifest |
+| POST | `/api/mcp/call` | MCP-compatible read-only call adapter |
 | POST | `/api/threads` | Create an identity-bound thread |
 | POST | `/api/threads/{thread_id}/runs` | Start a business task |
 | GET | `/api/threads/{thread_id}/stream` | Stream progress using SSE |
@@ -351,7 +356,9 @@ reasoning tokens.
 | DELETE | `/api/users/{user_id}/memories/{key}` | Delete one preference |
 
 Pydantic request/response schemas form the service boundary. Raw LangGraph
-state and implementation objects are never returned.
+state and implementation objects are never returned. Thread run/resume request
+bodies and every thread inspection query require `tenant_id`; a tenant mismatch
+returns the same 404 as a nonexistent thread.
 
 ## Streamlit workflow
 
@@ -631,6 +638,140 @@ suite. Model routing, synthesis, and answer quality belong to the live A800
 evaluation. The summary never substitutes test-fixture outcomes for measured
 model performance.
 
+## Runtime platform components
+
+### Observability
+
+`RuntimeObservability` preserves the existing checkpoint-safe
+`execution_trace` while adding real boundary spans and runtime metrics. The
+span tree uses actual calls only: `Agent Run` contains `Planner`/`Replanner`,
+`Tool/<name>` or `Retriever/research_search`, `LLM/<operation>`, and
+`Finalizer`. If the OpenTelemetry SDK is installed, spans use an isolated SDK
+provider. Setting `WORKBENCH_OTLP_ENDPOINT` enables the OTLP/HTTP exporter; an
+absent SDK or collector never prevents local startup. Disable instrumentation
+with `WORKBENCH_OBSERVABILITY_ENABLED=false`.
+
+Prometheus scrapes `GET /metrics`. Dotted runtime names are exported with the
+Prometheus-safe `workbench_` prefix and underscores:
+
+| Runtime name | Prometheus family |
+|---|---|
+| `agent.run.latency` | `workbench_agent_run_latency` |
+| `planner.latency`, `replanner.latency`, `llm.latency` | `workbench_planner_latency`, `workbench_replanner_latency`, `workbench_llm_latency` |
+| `retrieval.latency`, `tool.latency` | `workbench_retrieval_latency`, `workbench_tool_latency` |
+| `tool.calls`, `tool.errors`, `runtime.retries` | `workbench_tool_calls`, `workbench_tool_errors`, `workbench_runtime_retries` |
+| `planner.repairs` | `workbench_planner_repairs` |
+| `input_tokens`, `output_tokens`, `context_tokens`, `compressed_tokens`, `budget_headroom` | corresponding `workbench_*` families |
+| `hitl.wait_time`, `checkpoint.count`, `resume.count` | corresponding `workbench_*` families |
+| `run.success`, `run.failure` | `workbench_run_success`, `workbench_run_failure` |
+
+Minimal Prometheus scrape configuration:
+
+```yaml
+scrape_configs:
+  - job_name: enterprise-agent-runtime
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8010"]
+```
+
+Grafana can use that Prometheus data source directly. A starter dashboard can
+graph the latency histograms, `rate(workbench_tool_errors[5m])`,
+`rate(workbench_run_failure[5m])`, token counters, budget headroom, and HITL
+wait time. Grafana is not required to run the workbench.
+
+### ContextBudgetManager
+
+Planner and Replanner input construction passes through
+`ContextBudgetManager`. Its live tokenizer is the same injected exact Qwen
+tokenizer used by the runtime; explicit test mode uses the deterministic local
+tokenizer. Defaults are an 8,192-token context, 700-token generation reserve,
+and 256-token safety margin. Component budgets are configurable:
+
+```bash
+export WORKBENCH_CONTEXT_TOKENS=8192
+export WORKBENCH_GENERATION_RESERVE_TOKENS=700
+export WORKBENCH_CONTEXT_SAFETY_MARGIN_TOKENS=256
+export WORKBENCH_SYSTEM_CONTEXT_BUDGET=800
+export WORKBENCH_TOOL_CATALOG_CONTEXT_BUDGET=1800
+export WORKBENCH_MEMORY_CONTEXT_BUDGET=800
+export WORKBENCH_TOOL_RESULTS_CONTEXT_BUDGET=2000
+export WORKBENCH_CURRENT_TASK_CONTEXT_BUDGET=500
+```
+
+The deterministic policy keeps inputs already inside budget; truncates the
+current task at a tokenizer boundary; summarizes memory by sorted allowlisted
+preferences plus a bounded existing conversation summary; compresses tool
+results to stable fields and bounded outputs; and drops oldest/overflow items
+when no safe compact representation fits. It does not call another LLM.
+Retrieved evidence remains compressed by the existing Phase-5 extractive
+compressor before entering this manager. Each Planner state records decisions,
+token counts, compressed tokens, and headroom. The historical initial-Planner
+measurement remains 9,698 -> 1,790 exact tokens (-81.54%); it is documentation
+evidence, not a hard-coded runtime result.
+
+### Multi-tenant runtime namespace
+
+The runtime namespace is `tenant_id / user_id / thread_id / run_id`.
+`organization_id` is accepted only as a compatibility alias when creating a
+thread and must equal `tenant_id` when both are supplied. Checkpoint keys prefix
+the tenant, preference memory uses tenant/user keys, thread directory lookups
+require tenant/thread, traces and business-write audit rows carry tenant ID,
+and history/inspect/resume routes verify the tenant before checkpoint access.
+Tenant tool policy deny rules override Registry and RBAC visibility. The
+prototype still relies on caller-supplied identity; production authentication
+must derive `tenant_id`, user, and roles from verified credentials.
+
+### SDK and agentctl
+
+The synchronous Python SDK defaults to `http://127.0.0.1:8010`; override it
+with `AGENT_RUNTIME_BASE_URL`, `WORKBENCH_API_BASE_URL`, or the constructor:
+
+```python
+from apps.enterprise_agent_workbench.sdk import AgentRuntimeClient
+
+with AgentRuntimeClient() as client:
+    accepted = client.run(
+        tenant_id="demo-org",
+        thread_id="THREAD_ID",
+        task="Inspect campaign C102",
+    )
+    state = client.inspect_thread(
+        tenant_id="demo-org", thread_id="THREAD_ID"
+    )
+```
+
+Expose the bundled script on `PATH` or invoke the module directly:
+
+```bash
+export PATH="$PWD/apps/enterprise_agent_workbench/scripts:$PATH"
+agentctl --base-url http://127.0.0.1:8010 run \
+  --tenant-id demo-org --thread-id THREAD_ID --task "Inspect campaign C102"
+agentctl resume --tenant-id demo-org --thread-id THREAD_ID --decision approve
+agentctl threads inspect --tenant-id demo-org --thread-id THREAD_ID
+agentctl tools list --tenant-id demo-org --role viewer
+agentctl eval run --run-config-identity RUN_ID \
+  --fresh-isolated-database-confirmed
+```
+
+`AgentRuntimeClient` also exposes `resume`, `history`, `list_tools`, `health`,
+and `metrics`.
+
+### ToolGateway and MCP compatibility
+
+`ToolGateway` is the only graph execution path. It composes Registry lookup,
+Pydantic schema validation, version matching, RBAC, tenant allow/deny policy,
+timeout, idempotent retry, an in-memory token bucket, tenant-bound idempotency,
+safe audit hooks, and metrics. Side-effecting tools still require the existing
+HITL approve/edit record, and timed-out synchronous writes retain the existing
+transaction reconciliation behavior.
+
+`MCPToolAdapter` translates internal `ToolSpec` metadata to an MCP-compatible
+`tools` manifest and translates calls back through the same `ToolGateway`.
+This release intentionally exposes read-only tools only. It is a compatibility
+adapter, not a complete MCP server, transport implementation, or MCP
+certification claim.
+
 ## Tests
 
 Use the isolated workbench environment for application tests; no model download
@@ -649,6 +790,7 @@ with:
 ```bash
 bash -n apps/enterprise_agent_workbench/scripts/run_api.sh
 bash -n apps/enterprise_agent_workbench/scripts/run_ui.sh
+bash -n apps/enterprise_agent_workbench/scripts/agentctl
 ```
 
 ## Current limitations and production hardening
@@ -660,10 +802,15 @@ bash -n apps/enterprise_agent_workbench/scripts/run_ui.sh
   concurrency/load testing.
 - In-process run coordination and SSE need a durable queue/pub-sub layer for
   multiple API workers.
+- Prometheus counters, local span records, rate-limit buckets, and Gateway
+  idempotency cache are process-local; production multi-worker deployments need
+  shared telemetry and quota/idempotency stores. OTLP export is optional.
 - Authentication, SSO, tenant provisioning, key management, and network policy
   are outside this prototype. Caller-supplied IDs are not production identity.
 - Policy rules are code-backed examples and need enterprise governance,
   versioning, and independent authorization review.
+- The MCP layer is a read-only compatibility adapter, not a complete MCP
+  transport/server or conformance certification.
 - Retrieved open-domain evidence can be stale or misleading. Compression is
   lexical and citation presence does not prove support.
 - Approximate lexical token accounting is intentionally restricted to explicit

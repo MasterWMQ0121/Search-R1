@@ -238,6 +238,8 @@ class WorkbenchAPI:
 
     base_url: str = DEFAULT_API_BASE_URL
     timeout_seconds: float = 120.0
+    tenant_id: str = "demo-org"
+    role: str = "viewer"
 
     def _client(self):
         import httpx
@@ -252,7 +254,10 @@ class WorkbenchAPI:
 
     def tools(self) -> list[dict[str, Any]]:
         with self._client() as client:
-            payload = client.get("/api/tools")
+            payload = client.get(
+                "/api/tools",
+                params={"tenant_id": self.tenant_id, "role": self.role},
+            )
             payload.raise_for_status()
             value = payload.json()
         if isinstance(value, dict):
@@ -262,13 +267,15 @@ class WorkbenchAPI:
         return [dict(item) for item in value if isinstance(item, Mapping)]
 
     def create_thread(self, user_id: str, organization_id: str, role: str) -> str:
+        self.tenant_id = organization_id
+        self.role = role
         with self._client() as client:
             payload = _json_object(
                 client.post(
                     "/api/threads",
                     json={
                         "user_id": user_id,
-                        "organization_id": organization_id,
+                        "tenant_id": organization_id,
                         "role": role,
                     },
                 ),
@@ -279,25 +286,38 @@ class WorkbenchAPI:
     def start_run(self, thread_id: str, task: str) -> dict[str, Any]:
         with self._client() as client:
             return _json_object(
-                client.post(f"/api/threads/{thread_id}/runs", json={"task": task}),
+                client.post(
+                    f"/api/threads/{thread_id}/runs",
+                    json={"tenant_id": self.tenant_id, "task": task},
+                ),
                 "run start",
             )
 
     def state(self, thread_id: str) -> dict[str, Any]:
         with self._client() as client:
             return _json_object(
-                client.get(f"/api/threads/{thread_id}/state"), "thread state"
+                client.get(
+                    f"/api/threads/{thread_id}/state",
+                    params={"tenant_id": self.tenant_id},
+                ),
+                "thread state",
             )
 
     def history(self, thread_id: str) -> Any:
         with self._client() as client:
-            response = client.get(f"/api/threads/{thread_id}/history")
+            response = client.get(
+                f"/api/threads/{thread_id}/history",
+                params={"tenant_id": self.tenant_id},
+            )
             response.raise_for_status()
             return response.json()
 
     def trace(self, thread_id: str) -> list[dict[str, Any]]:
         with self._client() as client:
-            response = client.get(f"/api/threads/{thread_id}/trace")
+            response = client.get(
+                f"/api/threads/{thread_id}/trace",
+                params={"tenant_id": self.tenant_id},
+            )
             response.raise_for_status()
             payload = response.json()
         if isinstance(payload, dict):
@@ -313,7 +333,10 @@ class WorkbenchAPI:
         edited_arguments: Mapping[str, Any] | None = None,
         feedback: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"decision": decision}
+        payload: dict[str, Any] = {
+            "tenant_id": self.tenant_id,
+            "decision": decision,
+        }
         if edited_arguments is not None:
             payload["edited_arguments"] = dict(edited_arguments)
         if feedback:
@@ -328,7 +351,11 @@ class WorkbenchAPI:
         """Yield decoded SSE data objects for the active thread."""
 
         with self._client() as client:
-            with client.stream("GET", f"/api/threads/{thread_id}/stream") as response:
+            with client.stream(
+                "GET",
+                f"/api/threads/{thread_id}/stream",
+                params={"tenant_id": self.tenant_id},
+            ) as response:
                 response.raise_for_status()
                 event_name: str | None = None
                 for line in response.iter_lines():
@@ -468,6 +495,8 @@ def main() -> None:
         user_id = st.text_input("User ID", value="demo-operator")
         organization_id = st.text_input("Organization ID", value="demo-org")
         role = st.selectbox("Role", ["viewer", "analyst", "operator", "admin"], index=2)
+        api.tenant_id = organization_id
+        api.role = role
         thread_options = st.session_state.thread_ids
         selected = st.selectbox(
             "Thread",
