@@ -661,9 +661,14 @@ Prometheus-safe `workbench_` prefix and underscores:
 | `retrieval.latency`, `tool.latency` | `workbench_retrieval_latency`, `workbench_tool_latency` |
 | `tool.calls`, `tool.errors`, `runtime.retries` | `workbench_tool_calls`, `workbench_tool_errors`, `workbench_runtime_retries` |
 | `planner.repairs` | `workbench_planner_repairs` |
+| `grounded_argument_bindings` | `workbench_grounded_argument_bindings` |
 | `input_tokens`, `output_tokens`, `context_tokens`, `compressed_tokens`, `budget_headroom` | corresponding `workbench_*` families |
 | `hitl.wait_time`, `checkpoint.count`, `resume.count` | corresponding `workbench_*` families |
 | `run.success`, `run.failure` | `workbench_run_success`, `workbench_run_failure` |
+
+`grounded_argument_bindings` uses only the low-cardinality `tenant_id` and
+`argument_name` labels. Bound business values, thread IDs, and run IDs are never
+included in this metric.
 
 Minimal Prometheus scrape configuration:
 

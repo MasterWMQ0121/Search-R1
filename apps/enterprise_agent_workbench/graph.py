@@ -22,6 +22,7 @@ from .model_client import (
     PlannerParseError,
     PlannerSemanticValidationError,
     WorkbenchModelClient,
+    bind_grounded_identity_arguments,
     validate_planner_decision,
 )
 from .observability import RuntimeObservability
@@ -664,6 +665,13 @@ class WorkbenchGraph:
         try:
             # Defense in depth for test/deterministic clients as well as the live
             # HTTP client, which already performs this validation before repair.
+            original_argument_fields = set(decision.arguments)
+            decision = bind_grounded_identity_arguments(
+                decision, planner_context
+            )
+            graph_binding_names = tuple(
+                sorted(set(decision.arguments) - original_argument_fields)
+            )
             decision = validate_planner_decision(decision, planner_context)
             action = decision.next_action
             if action == "finalizer":
@@ -741,6 +749,19 @@ class WorkbenchGraph:
             },
         )
         repair_count = int(getattr(self.model_client, "last_planner_repairs", 0))
+        raw_binding_names = getattr(
+            self.model_client, "last_grounded_argument_bindings", ()
+        )
+        if not isinstance(raw_binding_names, (list, tuple, set, frozenset)):
+            raw_binding_names = ()
+        binding_names = sorted(
+            {
+                name
+                for name in (*raw_binding_names, *graph_binding_names)
+                if isinstance(name, str)
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", name)
+            }
+        )
         self.observability.counter(
             "output_tokens",
             self.context_budget_manager.token_count(payload),
@@ -753,6 +774,12 @@ class WorkbenchGraph:
                 repair_count,
                 tenant_id=state["tenant_id"],
                 operation=node,
+            )
+        for argument_name in binding_names:
+            self.observability.counter(
+                "grounded_argument_bindings",
+                tenant_id=state["tenant_id"],
+                argument_name=argument_name,
             )
         events = []
         if repair_count:

@@ -254,18 +254,13 @@ async def test_live_descriptive_action_is_semantically_repaired_to_exact_tool_id
 
 
 @pytest.mark.asyncio
-async def test_replanner_repairs_missing_campaign_id_from_bounded_live_context():
+async def test_replanner_binds_missing_campaign_id_without_llm_repair():
     invalid = _decision(
         objective="Explain why campaign ROI declined.",
         next_action="get_campaign",
         arguments={},
     )
-    repaired = _decision(
-        objective="Explain why C102 ROI declined.",
-        next_action="get_campaign",
-        arguments={"campaign_id": "C102"},
-    )
-    responses = iter([json.dumps(invalid), json.dumps(repaired)])
+    responses = iter([json.dumps(invalid)])
     prompts = []
     prior_result = {
         "tool_name": "roi_anomaly_detection",
@@ -308,30 +303,10 @@ async def test_replanner_repairs_missing_campaign_id_from_bounded_live_context()
         )
 
     assert result.arguments == {"campaign_id": "C102"}
-    assert client.last_planner_repairs == 1
-    repair_prompt = prompts[1]
-    assert 'REPAIR_TASK="Explain why C102 ROI declined."' in repair_prompt
-    routing_line = next(
-        line for line in repair_prompt.splitlines() if line.startswith("ROUTING_CONTEXT=")
-    )
-    routing_context = json.loads(routing_line.removeprefix("ROUTING_CONTEXT="))
-    previous = routing_context["previous_tools"][0]
-    assert previous["tool_name"] == "roi_anomaly_detection"
-    assert previous["arguments"] == {
-        "campaign_id": "C102",
-        "start_date": "2025-01-01",
-    }
-    assert previous["source_ids"] == ["CAMPAIGN-METRICS-C102"]
-    assert previous["routing_facts"]["operation"] == "roi_anomaly_detection"
-    assert len(json.dumps(routing_context)) <= 4_000
-    assert "idempotency_key" not in routing_line
-    for forbidden in (
-        "must-not-leak-control-key",
-        "full-tool-output-must-not-leak",
-        "private-chain-must-not-leak",
-        "sk-supersecret999",
-    ):
-        assert forbidden not in repair_prompt
+    assert client.last_planner_repairs == 0
+    assert client.last_planner_failure_signatures == []
+    assert client.last_grounded_argument_bindings == ["campaign_id"]
+    assert len(prompts) == 1
 
 
 @pytest.mark.asyncio

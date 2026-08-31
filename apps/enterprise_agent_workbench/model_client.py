@@ -252,12 +252,11 @@ def _argument_constraint_errors(
     return errors
 
 
-def validate_planner_decision(
-    decision: PlannerDecision, context: dict[str, Any]
-) -> PlannerDecision:
-    """Validate exact action and compact input semantics supplied by the caller."""
+def _canonical_action_contract(
+    decision: PlannerDecision, catalog: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """Validate the canonical action boundary and return its argument contract."""
 
-    catalog = _planner_catalog(context)
     contracts = {item["name"]: item for item in catalog}
     allowed = sorted([*contracts, "finalizer"])
     if decision.completed != (decision.next_action == "finalizer"):
@@ -276,6 +275,147 @@ def validate_planner_decision(
             ),
         )
     if decision.next_action == "finalizer":
+        return None
+    return contracts[decision.next_action]["arguments"]
+
+
+_BINDING_CONTROL_IDENTITY_FIELDS = frozenset(
+    {
+        "idempotency_key",
+        "tenant_id",
+        "tenant_ids",
+        "organization_id",
+        "organization_ids",
+        "org_id",
+        "org_ids",
+        "user_id",
+        "user_ids",
+        "thread_id",
+        "thread_ids",
+        "run_id",
+        "run_ids",
+        "trace_id",
+        "trace_ids",
+        "span_id",
+        "span_ids",
+    }
+)
+_CANONICAL_TOOL_ID = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
+
+
+def _is_bindable_identity_argument(field: Any) -> bool:
+    if not isinstance(field, str):
+        return False
+    normalized = field.casefold()
+    identity_like = (
+        normalized == "id"
+        or normalized.endswith("_id")
+        or normalized.endswith("_ids")
+    )
+    return (
+        identity_like
+        and normalized not in _BINDING_CONTROL_IDENTITY_FIELDS
+        and _REPAIR_SENSITIVE_KEY.search(field) is None
+    )
+
+
+def _stable_json_candidate(value: Any) -> str | None:
+    """Return a stable JSON equality key, rejecting non-JSON argument values."""
+
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _bind_grounded_identity_arguments(
+    decision: PlannerDecision, context: dict[str, Any]
+) -> tuple[PlannerDecision, tuple[str, ...]]:
+    """Carry forward unambiguous validated identities into missing required fields.
+
+    This is intentionally not general argument completion. Candidates come only
+    from the same-named top-level ``arguments`` field of successful prior Tool
+    results. Arbitrary output, task text, prose, and control-plane metadata are
+    never inspected.
+    """
+
+    catalog = _planner_catalog(context)
+    argument_contracts = _canonical_action_contract(decision, catalog)
+    if argument_contracts is None:
+        return decision, ()
+
+    missing_identity_fields = sorted(
+        field
+        for field, contract in argument_contracts.items()
+        if isinstance(contract, dict)
+        and contract.get("required") is True
+        and field not in decision.arguments
+        and _is_bindable_identity_argument(field)
+    )
+    if not missing_identity_fields:
+        return decision, ()
+
+    prior_results = context.get("prior_tool_results")
+    if not isinstance(prior_results, list):
+        return decision, ()
+
+    bindings: dict[str, Any] = {}
+    for field in missing_identity_fields:
+        unique_candidates: dict[str, Any] = {}
+        for result in prior_results:
+            if not isinstance(result, dict) or result.get("status") != "ok":
+                continue
+            tool_name = result.get("tool_name")
+            if not isinstance(tool_name, str) or _CANONICAL_TOOL_ID.fullmatch(
+                tool_name
+            ) is None:
+                continue
+            validated_arguments = result.get("arguments")
+            if (
+                not isinstance(validated_arguments, dict)
+                or field not in validated_arguments
+            ):
+                continue
+            value = validated_arguments[field]
+            stable_key = _stable_json_candidate(value)
+            if stable_key is not None:
+                unique_candidates.setdefault(stable_key, json.loads(stable_key))
+        if len(unique_candidates) == 1:
+            bindings[field] = next(iter(unique_candidates.values()))
+
+    if not bindings:
+        return decision, ()
+    return (
+        decision.model_copy(
+            update={"arguments": {**decision.arguments, **bindings}}
+        ),
+        tuple(sorted(bindings)),
+    )
+
+
+def bind_grounded_identity_arguments(
+    decision: PlannerDecision, context: dict[str, Any]
+) -> PlannerDecision:
+    """Return a decision with safe grounded identity bindings, if any."""
+
+    bound, _ = _bind_grounded_identity_arguments(decision, context)
+    return bound
+
+
+def validate_planner_decision(
+    decision: PlannerDecision, context: dict[str, Any]
+) -> PlannerDecision:
+    """Validate exact action and compact input semantics supplied by the caller."""
+
+    catalog = _planner_catalog(context)
+    argument_contracts = _canonical_action_contract(decision, catalog)
+    if decision.next_action == "finalizer":
         if decision.arguments:
             raise PlannerSemanticValidationError(
                 "arguments must be empty when next_action is finalizer",
@@ -285,7 +425,7 @@ def validate_planner_decision(
             )
         return decision
 
-    argument_contracts = contracts[decision.next_action]["arguments"]
+    assert argument_contracts is not None
     if "idempotency_key" in decision.arguments:
         raise PlannerSemanticValidationError(
             "arguments.idempotency_key is control-plane metadata and must be omitted",
@@ -796,6 +936,9 @@ class VLLMHTTPModelClient:
         self._last_planner_failure_signatures = ContextVar[tuple[str, ...]](
             f"workbench_planner_failure_signatures_{id(self)}", default=()
         )
+        self._last_grounded_argument_bindings = ContextVar[tuple[str, ...]](
+            f"workbench_grounded_argument_bindings_{id(self)}", default=()
+        )
 
     @property
     def last_planner_repairs(self) -> int:
@@ -816,6 +959,12 @@ class VLLMHTTPModelClient:
     @property
     def last_planner_failure_signatures(self) -> list[str]:
         return list(self._last_planner_failure_signatures.get())
+
+    @property
+    def last_grounded_argument_bindings(self) -> list[str]:
+        """Identity field names bound on the final fully validated decision."""
+
+        return list(self._last_grounded_argument_bindings.get())
 
     def _record_semantic_failure(
         self, error: PlannerSemanticValidationError
@@ -863,6 +1012,7 @@ class VLLMHTTPModelClient:
     ) -> PlannerDecision:
         self.last_planner_repairs = 0
         self._last_planner_failure_signatures.set(())
+        self._last_grounded_argument_bindings.set(())
         try:
             catalog = _planner_catalog(context)
         except PlannerSemanticValidationError as error:
@@ -911,9 +1061,13 @@ class VLLMHTTPModelClient:
         )
         first = await self._chat([{"role": "user", "content": prompt}], max_tokens=700)
         try:
-            return _validate_with_caller_contract(
-                parse_planner_decision(first), context
+            parsed_first = parse_planner_decision(first)
+            bound_first, bound_fields = _bind_grounded_identity_arguments(
+                parsed_first, context
             )
+            validated_first = _validate_with_caller_contract(bound_first, context)
+            self._last_grounded_argument_bindings.set(bound_fields)
+            return validated_first
         except ValueError as first_error:
             if isinstance(first_error, PlannerSemanticValidationError):
                 self._record_semantic_failure(first_error)
@@ -959,15 +1113,19 @@ class VLLMHTTPModelClient:
                     [{"role": "user", "content": repair_prompt}], max_tokens=700
                 )
                 parsed_repair = parse_planner_decision(repaired)
-                validated_repair = _validate_with_caller_contract(
+                bound_repair, bound_fields = _bind_grounded_identity_arguments(
                     parsed_repair, context
+                )
+                validated_repair = _validate_with_caller_contract(
+                    bound_repair, context
                 )
                 _validate_repair_grounding(
                     invalid_response=first,
-                    repaired=parsed_repair,
+                    repaired=bound_repair,
                     repair_task=repair_task,
                     routing_context=routing_context,
                 )
+                self._last_grounded_argument_bindings.set(bound_fields)
                 return validated_repair
             except (ValueError, httpx.HTTPError, RuntimeError) as repair_error:
                 if isinstance(repair_error, PlannerSemanticValidationError):

@@ -21,6 +21,7 @@ METRIC_TYPES: dict[str, str] = {
     "tool.calls": "counter",
     "tool.errors": "counter",
     "planner.repairs": "counter",
+    "grounded_argument_bindings": "counter",
     "runtime.retries": "counter",
     "input_tokens": "counter",
     "output_tokens": "counter",
